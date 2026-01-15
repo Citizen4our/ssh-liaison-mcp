@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-liaison-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-ssh2-lite",

@@ -1,18 +1,16 @@
-use rmcp::{
-    handler::server::{
-        router::tool::ToolRouter,
-        wrapper::Parameters,
-    },
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ServiceExt, transport::stdio,
-    ErrorData as McpError,
-};
 use anyhow::Result;
+use rmcp::{
+    ErrorData as McpError, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+    transport::stdio,
+};
 
 use crate::ssh::SessionManager;
 
 pub mod tools;
-use tools::{SshConnectParams, SshReadLogParams, SshRunCommandParams};
+use tools::{SshConnectDirectParams, SshConnectParams, SshReadLogParams, SshRunCommandParams};
 
 pub struct SshMcpServer {
     session_manager: SessionManager,
@@ -40,6 +38,17 @@ impl SshMcpServer {
         params: Parameters<SshConnectParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::ssh_connect_impl(&self.session_manager, params).await
+    }
+
+    #[tool(
+        name = "ssh_connect_direct",
+        description = "Connect to a remote SSH server directly using user, hostname/IP, optional password, and optional port. Establishes a persistent shell session that preserves state between commands. If password is not provided or fails, SSH key authentication will be attempted. WARNING: Only use for read-only operations unless explicitly authorized. Password is transmitted securely over SSH."
+    )]
+    pub async fn ssh_connect_direct(
+        &self,
+        params: Parameters<SshConnectDirectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ssh_connect_direct_impl(&self.session_manager, params).await
     }
 
     #[tool(
@@ -84,20 +93,21 @@ impl rmcp::ServerHandler for SshMcpServer {
 
 pub async fn run_mcp_server() -> Result<()> {
     use std::io::Write;
-    
+
     // Log startup information to stderr (stdout is used for MCP protocol)
     let version = env!("CARGO_PKG_VERSION");
     let name = env!("CARGO_PKG_NAME");
-    
+
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("🚀 {} v{}", name, version);
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("📡 MCP Server starting...");
     eprintln!("");
     eprintln!("📦 Available tools:");
-    eprintln!("   • ssh_connect      - Connect to SSH host via ~/.ssh/config");
-    eprintln!("   • ssh_run_command  - Execute commands on connected host");
-    eprintln!("   • ssh_read_log     - Read log files from remote host");
+    eprintln!("   • ssh_connect         - Connect to SSH host via ~/.ssh/config");
+    eprintln!("   • ssh_connect_direct   - Connect to SSH host directly (user/host/password)");
+    eprintln!("   • ssh_run_command     - Execute commands on connected host");
+    eprintln!("   • ssh_read_log        - Read log files from remote host");
     eprintln!("");
     eprintln!("💡 Usage in Cursor/Claude:");
     eprintln!("   Ask AI to connect to a host and run commands");
@@ -108,7 +118,7 @@ pub async fn run_mcp_server() -> Result<()> {
     eprintln!("✅ Server ready, waiting for MCP requests...");
     eprintln!("");
     std::io::stderr().flush()?;
-    
+
     let server = SshMcpServer::new();
     let service = match server.serve(stdio()).await {
         Ok(s) => s,
@@ -117,7 +127,7 @@ pub async fn run_mcp_server() -> Result<()> {
             return Err(e.into());
         }
     };
-    
+
     // Wait for service to complete (or be interrupted)
     match service.waiting().await {
         Ok(_) => {
@@ -136,6 +146,6 @@ pub async fn run_mcp_server() -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }

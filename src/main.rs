@@ -12,7 +12,7 @@ struct Cli {
     /// Verbosity level (use -v, -vv, -vvv for more debug output)
     #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
-    
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -54,7 +54,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     // Debug mode based on verbosity
     let debug = cli.verbose >= 3;
     if debug {
@@ -68,17 +68,24 @@ async fn main() -> Result<()> {
             // MCP server mode - all output goes to stderr to avoid interfering with stdio protocol
             mcp::run_mcp_server().await?;
         }
-        Commands::Cli { host, user, hostname, password, port } => {
+        Commands::Cli {
+            host,
+            user,
+            hostname,
+            password,
+            port,
+        } => {
             cli::run_cli_mode(host, user, hostname, password, port).await?;
         }
         Commands::Connect { user, host, port } => {
             let manager = ssh::SessionManager::new();
             eprintln!("Connecting to {}@{}:{}...", user, host, port);
-            manager.connect_direct("direct", &user, &host, Some(port))
+            manager
+                .connect_direct("direct", &user, &host, Some(port))
                 .await
                 .with_context(|| format!("Failed to connect to {}@{}:{}", user, host, port))?;
             eprintln!("Connected successfully!");
-            
+
             // Simple command loop
             loop {
                 print!("ssh> ");
@@ -86,15 +93,15 @@ async fn main() -> Result<()> {
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 let command = input.trim();
-                
+
                 if command.is_empty() {
-                continue;
+                    continue;
                 }
-                
+
                 if command == "exit" || command == "quit" {
                     break;
                 }
-                
+
                 match manager.execute_command("direct", command).await {
                     Ok(output) => {
                         // Output stdout
@@ -117,10 +124,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             manager.disconnect("direct").await?;
         }
     }
-    
+
     Ok(())
 }

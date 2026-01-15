@@ -14,8 +14,7 @@ pub struct SshHostConfig {
 }
 
 pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
-    let home = std::env::var("HOME")
-        .context("HOME environment variable not set")?;
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
     let config_path = PathBuf::from(&home).join(".ssh").join("config");
 
     if !config_path.exists() {
@@ -30,7 +29,7 @@ pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
 
     for line in content.lines() {
         let line = line.trim();
-        
+
         // Skip comments and empty lines
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -42,13 +41,16 @@ pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
             if !host.is_empty() {
                 current_host = Some(host.to_string());
                 if !hosts.contains_key(host) {
-                    hosts.insert(host.to_string(), SshHostConfig {
-                        host: host.to_string(),
-                        hostname: None,
-                        user: None,
-                        port: None,
-                        identity_file: None,
-                    });
+                    hosts.insert(
+                        host.to_string(),
+                        SshHostConfig {
+                            host: host.to_string(),
+                            hostname: None,
+                            user: None,
+                            port: None,
+                            identity_file: None,
+                        },
+                    );
                 }
             }
             continue;

@@ -261,14 +261,12 @@ static OSC_REGEX: OnceLock<Regex> = OnceLock::new();
 static OTHER_ESCAPE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn clean_ansi_sequences(text: &str) -> String {
-    let ansi_re = ANSI_REGEX.get_or_init(|| {
-        Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("ANSI regex should be valid")
-    });
+    let ansi_re = ANSI_REGEX
+        .get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("ANSI regex should be valid"));
     let mut cleaned = ansi_re.replace_all(text, "").to_string();
 
-    let osc_re = OSC_REGEX.get_or_init(|| {
-        Regex::new(r"\x1b\][^\x07]*\x07").expect("OSC regex should be valid")
-    });
+    let osc_re = OSC_REGEX
+        .get_or_init(|| Regex::new(r"\x1b\][^\x07]*\x07").expect("OSC regex should be valid"));
     cleaned = osc_re.replace_all(&cleaned, "").to_string();
 
     let other_re = OTHER_ESCAPE_REGEX.get_or_init(|| {

@@ -12,27 +12,73 @@ pub async fn run_cli_mode(
 ) -> Result<()> {
     let manager = SessionManager::new();
     let mut current_host: Option<String> = None;
-    
+
     // Connect immediately if credentials provided
     if let (Some(user), Some(hostname)) = (user, hostname) {
         let alias = host_alias.as_deref().unwrap_or("direct");
         eprintln!("Connecting to {}@{}:{}...", user, hostname, port);
-        
-        if let Some(pass) = password {
-            manager.connect_with_password(alias, &user, &hostname, &pass, Some(port))
-                .await
-                .with_context(|| format!("Failed to connect to {}@{}:{}", user, hostname, port))?;
-        } else {
-            manager.connect_direct(alias, &user, &hostname, Some(port))
-                .await
-                .with_context(|| format!("Failed to connect to {}@{}:{}", user, hostname, port))?;
+
+        // Try SSH key authentication first (standard SSH behavior)
+        let mut connected = false;
+        match manager
+            .connect_direct(alias, &user, &hostname, Some(port))
+            .await
+        {
+            Ok(()) => {
+                eprintln!("Connected successfully using SSH keys!");
+                connected = true;
+            }
+            Err(e) => {
+                eprintln!("SSH key authentication failed: {}", e);
+                if let Some(pass) = password {
+                    if !pass.is_empty() {
+                        eprintln!("Trying password authentication...");
+                        match manager
+                            .connect_with_password(alias, &user, &hostname, &pass, Some(port))
+                            .await
+                        {
+                            Ok(()) => {
+                                eprintln!("Connected successfully using password!");
+                                connected = true;
+                            }
+                            Err(e2) => {
+                                anyhow::bail!(
+                                    "Failed to connect to {}@{}:{} - SSH keys failed: {}, password failed: {}",
+                                    user,
+                                    hostname,
+                                    port,
+                                    e,
+                                    e2
+                                );
+                            }
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "Failed to connect to {}@{}:{} - {}",
+                            user,
+                            hostname,
+                            port,
+                            e
+                        );
+                    }
+                } else {
+                    anyhow::bail!(
+                        "Failed to connect to {}@{}:{} - {}",
+                        user,
+                        hostname,
+                        port,
+                        e
+                    );
+                }
+            }
         }
-        eprintln!("Connected successfully!");
+
         current_host = Some(alias.to_string());
     } else if let Some(ref alias) = host_alias {
         // Connect using SSH config alias
         eprintln!("Connecting to {}...", alias);
-        manager.connect_by_alias(alias)
+        manager
+            .connect_by_alias(alias)
             .await
             .with_context(|| format!("Failed to connect to '{}'", alias))?;
         eprintln!("Connected successfully!");
@@ -86,42 +132,67 @@ pub async fn run_cli_mode(
                     eprintln!("   or: connect <user> <hostname> [password] [port]");
                     continue;
                 }
-                
+
                 if let Some(ref old_alias) = current_host {
                     let _ = manager.disconnect(old_alias).await;
                 }
-                
+
                 // Try direct connection format: connect user hostname [password] [port]
                 if args.len() >= 2 {
                     let user = args[0];
                     let hostname = args[1];
                     let password = args.get(2).copied();
-                    let port = args.get(3).and_then(|p| p.parse::<u16>().ok()).unwrap_or(22);
-                    
+                    let port = args
+                        .get(3)
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(22);
+
                     eprintln!("Connecting to {}@{}:{}...", user, hostname, port);
                     let alias = format!("{}_{}", user, hostname);
-                    
-                    match password {
-                        Some(pass) => {
-                            match manager.connect_with_password(&alias, user, hostname, pass, Some(port)).await {
-                                Ok(()) => {
-                                    eprintln!("Connected successfully!");
-                                    current_host = Some(alias);
-                                }
-                                Err(e) => {
-                                    eprintln!("Connection failed: {}", e);
-                                }
-                            }
+
+                    // Try SSH key authentication first (standard SSH behavior)
+                    let mut connected = false;
+                    match manager
+                        .connect_direct(&alias, user, hostname, Some(port))
+                        .await
+                    {
+                        Ok(()) => {
+                            eprintln!("Connected successfully using SSH keys!");
+                            current_host = Some(alias.clone());
+                            connected = true;
                         }
-                        None => {
-                            match manager.connect_direct(&alias, user, hostname, Some(port)).await {
-                                Ok(()) => {
-                                    eprintln!("Connected successfully!");
-                                    current_host = Some(alias);
-                                }
-                                Err(e) => {
+                        Err(e) => {
+                            eprintln!("SSH key authentication failed: {}", e);
+                            if let Some(pass) = password {
+                                if !pass.is_empty() {
+                                    eprintln!("Trying password authentication...");
+                                    match manager
+                                        .connect_with_password(
+                                            &alias,
+                                            user,
+                                            hostname,
+                                            pass,
+                                            Some(port),
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            eprintln!("Connected successfully using password!");
+                                            current_host = Some(alias);
+                                            connected = true;
+                                        }
+                                        Err(e2) => {
+                                            eprintln!(
+                                                "Connection failed: SSH keys failed: {}, password failed: {}",
+                                                e, e2
+                                            );
+                                        }
+                                    }
+                                } else {
                                     eprintln!("Connection failed: {}", e);
                                 }
+                            } else {
+                                eprintln!("Connection failed: {}", e);
                             }
                         }
                     }

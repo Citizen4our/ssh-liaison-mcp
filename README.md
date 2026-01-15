@@ -19,6 +19,7 @@
 | 🔄 **Stateful Sessions** | **Core feature**: Shell state (current directory, environment variables, working directory) is preserved between MCP tool calls. Each command runs in the same persistent shell session, allowing multi-step workflows. |
 | 🔌 **MCP Server Mode** | Integrate with Cursor/Claude Desktop for AI-assisted SSH operations with stateful command execution |
 | ⚙️ **SSH Config Support** | Uses `~/.ssh/config` for host aliases and connection parameters |
+| 🔐 **Direct Connection** | Connect directly using user/hostname/password/port without SSH config requirement |
 | 💻 **Standalone CLI Mode** | Interactive terminal for debugging and testing (see below) |
 
 ---
@@ -149,13 +150,20 @@ When running as MCP server, the following tools are available:
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | **ssh_connect** | Connect to remote SSH server and establish a **persistent shell session**. The session maintains state between subsequent command calls. | `host_alias` (string) - Host alias defined in SSH config |
+| **ssh_connect_direct** | Connect to remote SSH server directly using user, hostname/IP, optional password, and optional port. Establishes a **persistent shell session** that maintains state between subsequent command calls. Authentication tries SSH keys first, then password if provided. | `host_alias` (string) - Host alias to identify this connection, `user` (string) - SSH username, `hostname` (string) - Hostname or IP address, `password` (string, optional) - SSH password (if SSH keys fail or not available), `port` (integer, optional) - SSH port (default: 22) |
 | **ssh_run_command** | Execute command on connected host in the **same persistent shell session**. Current directory, environment variables, and shell state are preserved from previous commands. | `host` (string) - Host alias, `command` (string) - Command to execute |
 | **ssh_read_log** | Read last N lines from log file using the persistent shell session. | `host` (string) - Host alias, `file_path` (string) - Path to log file, `lines` (integer) - Number of lines to read |
 
 **Important Notes:**
 - **Stateful**: All commands for the same host run in the same persistent shell session
-- **SSH Config Required**: In MCP mode, connections use SSH config aliases. For direct connections (user/hostname/password), use CLI mode instead
+- **Connection Methods**: 
+  - Use `ssh_connect` for SSH config-based connections (requires `~/.ssh/config`)
+  - Use `ssh_connect_direct` for direct connections without SSH config requirement
+- **Authentication Order** (for `ssh_connect_direct`):
+  1. SSH keys (SSH agent, then common key files)
+  2. Password (if provided and SSH keys fail)
 - **Session Persistence**: Once connected, the session remains active until the MCP server is restarted or explicitly disconnected
+- **Security**: Passwords in `ssh_connect_direct` are transmitted securely over SSH protocol (encrypted). SSH key authentication is preferred when available.
 
 ### Example Prompts for MCP Mode
 
@@ -198,6 +206,38 @@ Last 50 lines from /var/log/nginx/error.log:
 
 **Example 3:**
 ```
+User: Connect directly to 192.168.88.63 as user pi and show disk usage
+```
+
+**AI Response:**
+```
+I'll connect directly to 192.168.88.63 as user pi and check the disk usage.
+
+[Connecting to 192.168.88.63 using SSH keys...]
+
+Disk usage:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        15G  5.2G  8.8G  38% /
+/dev/mmcblk0p1  253M   49M  204M  20% /boot
+```
+
+**Example 3b (with password):**
+```
+User: Connect to 192.168.88.63 as user admin with password mypass123 and check uptime
+```
+
+**AI Response:**
+```
+I'll connect to 192.168.88.63 as user admin and check the system uptime.
+
+[Connecting to 192.168.88.63...]
+[SSH key authentication failed, trying password...]
+
+System uptime: 5 days, 12 hours, 30 minutes
+```
+
+**Example 4:**
+```
 User: Check system uptime and memory usage on the dev server
 ```
 
@@ -214,7 +254,7 @@ Mem:           7.8G        2.1G        3.2G        128M        2.5G        5.4G
 Swap:          2.0G          0B        2.0G
 ```
 
-**Example 4:**
+**Example 5:**
 ```
 User: Show me running processes and check if nginx service is running on production
 ```
@@ -318,6 +358,8 @@ ssh> connect dev-server
 
 ## 🔐 Authentication
 
+### For `ssh_connect` (SSH Config)
+
 The server attempts authentication in the following order:
 
 1. **SSH agent** (if available)
@@ -327,6 +369,11 @@ The server attempts authentication in the following order:
    - `~/.ssh/id_rsa`
    - `~/.ssh/id_ecdsa`
    - `~/.ssh/id_dsa`
+
+### For `ssh_connect_direct` (Direct Connection)
+
+1. **SSH keys** (same order as above)
+2. **Password** (if provided and SSH keys fail or are not available)
 
 ---
 
@@ -350,6 +397,105 @@ cargo build --release
 # Run tests
 cargo test
 ```
+
+---
+
+## 📋 TODO / Future Improvements
+
+### Infrastructure & Distribution
+
+- [ ] **CI/CD Pipeline (GitHub Actions)**
+  - [ ] Automated tests on push/PR
+  - [ ] Linting and formatting checks (clippy, rustfmt)
+  - [ ] Build for multiple platforms (Linux, macOS, Windows)
+  - [ ] Automated release workflow
+
+- [ ] **Release Automation**
+  - [ ] GitHub Actions workflow for creating releases
+  - [ ] Automatic binary builds for major platforms
+  - [ ] GitHub Releases with pre-built binaries
+  - [ ] Version bumping automation
+
+- [ ] **Crates.io Publication**
+  - [ ] Prepare crate metadata (description, keywords, categories)
+  - [ ] Add crate documentation
+  - [ ] Publish to crates.io
+
+### Features
+
+- [ ] **Sudo Password Elicitation**
+  - [ ] Implement password prompt handling for sudo commands
+  - [ ] Secure password input via MCP prompts
+  - [ ] Password caching for session duration
+
+
+- [ ] **Session Management**
+  - [ ] `ssh_disconnect` tool to explicitly close sessions
+  - [ ] `ssh_list_sessions` tool to show active connections
+  - [ ] Automatic session cleanup on timeout
+  - [ ] Session health checks and reconnection
+
+- [ ] **Enhanced Error Handling**
+  - [ ] Better error messages with context
+  - [ ] Connection retry logic
+  - [ ] Graceful handling of network interruptions
+  - [ ] Session recovery mechanisms
+
+- [ ] **File Operations**
+  - [ ] `ssh_read_file` tool for reading remote files
+  - [ ] `ssh_write_file` tool (with safety checks)
+  - [ ] `ssh_list_directory` tool for directory listings
+  - [ ] Support for binary file transfers
+
+- [ ] **Monitoring & Observability**
+  - [ ] Connection status monitoring
+  - [ ] Optional verbose logging mode
+
+### Code Quality
+
+- [ ] **Testing**
+  - [ ] Unit tests for SSH session management
+  - [ ] Integration tests for MCP tools
+  - [ ] Mock SSH server for testing
+  - [ ] CLI mode tests
+
+- [ ] **Documentation**
+  - [ ] API documentation (rustdoc)
+  - [ ] Architecture documentation
+  - [ ] Contributing guidelines
+  - [ ] Security best practices guide
+
+- [ ] **Code Improvements**
+  - [ ] Refactor error handling patterns
+  - [ ] Add more comprehensive logging
+  - [ ] Performance optimizations
+  - [ ] Code coverage improvements
+
+### Platform Support
+
+- [ ] **Cross-platform Binary Releases**
+  - [ ] Linux (x86_64, ARM64)
+  - [ ] macOS (Intel, Apple Silicon)
+  - [ ] Windows (if feasible with SSH2 library)
+
+- [ ] **Package Managers**
+  - [ ] Homebrew formula for macOS
+  - [ ] AUR package for Arch Linux
+  - [ ] Cargo install instructions
+
+### Security Enhancements
+
+- [ ] **Security Audit**
+  - [ ] Dependency security scanning
+  - [ ] Code security review
+  - [ ] Penetration testing considerations
+
+- [ ] **Access Control**
+  - [ ] Optional host allowlist/denylist
+  - [ ] Command whitelisting/blacklisting
+  - [ ] Rate limiting for connections
+
+---
 
 ## 📄 License
 
