@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing::Level;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod cli;
 mod mcp;
@@ -9,7 +11,7 @@ mod ssh;
 #[command(name = "ssh-liaison-mcp")]
 #[command(about = "SSH Liaison MCP Server - SSH connection and command execution via MCP or CLI")]
 struct Cli {
-    /// Verbosity level (use -v, -vv, -vvv for more debug output)
+    /// Verbosity level (-v: info, -vv: debug, -vvv: trace)
     #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
@@ -51,21 +53,31 @@ enum Commands {
     },
 }
 
+fn init_tracing(verbose: u8) {
+    let level = match verbose {
+        0 => Level::WARN,
+        1 => Level::INFO,
+        2 => Level::DEBUG,
+        _ => Level::TRACE,
+    };
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.as_str()));
+
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(filter)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Debug mode based on verbosity
-    let debug = cli.verbose >= 3;
-    if debug {
-        unsafe {
-            std::env::set_var("SSH_LIAISON_DEBUG", "1");
-        }
-    }
+    init_tracing(cli.verbose);
 
     match cli.command {
         Commands::Serve => {
-            // MCP server mode - all output goes to stderr to avoid interfering with stdio protocol
             mcp::run_mcp_server().await?;
         }
         Commands::Cli {
@@ -79,14 +91,13 @@ async fn main() -> Result<()> {
         }
         Commands::Connect { user, host, port } => {
             let manager = ssh::SessionManager::new();
-            eprintln!("Connecting to {}@{}:{}...", user, host, port);
+            tracing::info!(user = %user, host = %host, port = %port, "Connecting");
             manager
                 .connect_direct("direct", &user, &host, Some(port))
                 .await
                 .with_context(|| format!("Failed to connect to {}@{}:{}", user, host, port))?;
-            eprintln!("Connected successfully!");
+            tracing::info!("Connected successfully");
 
-            // Simple command loop
             loop {
                 print!("ssh> ");
                 std::io::Write::flush(&mut std::io::stdout())?;
@@ -102,16 +113,14 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                match manager.execute_command("direct", command).await {
+                match manager.execute_command("direct", command, None).await {
                     Ok(output) => {
-                        // Output stdout
                         if !output.stdout.trim().is_empty() {
                             print!("{}", output.stdout.trim_end());
                             if !output.stdout.trim_end().ends_with('\n') {
                                 println!();
                             }
                         }
-                        // Output stderr
                         if !output.stderr.trim().is_empty() {
                             eprint!("{}", output.stderr.trim_end());
                             if !output.stderr.trim_end().ends_with('\n') {
@@ -120,7 +129,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error: {}", e);
+                        tracing::error!(error = %e, "Command execution failed");
                     }
                 }
             }

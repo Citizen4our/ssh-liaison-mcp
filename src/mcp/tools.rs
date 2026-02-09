@@ -23,6 +23,10 @@ pub struct SshRunCommandParams {
     pub host: String,
     #[schemars(description = "Command to execute on remote host")]
     pub command: String,
+    #[schemars(
+        description = "Optional sudo password when command requires it. Use with caution; prefer passwordless sudo."
+    )]
+    pub sudo_password: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -79,7 +83,6 @@ pub async fn ssh_connect_direct_impl(
 ) -> Result<CallToolResult, McpError> {
     let p = &params.0;
 
-    // Try SSH key authentication first (standard SSH behavior)
     match session_manager
         .connect_direct(&p.host_alias, &p.user, &p.hostname, p.port)
         .await
@@ -91,40 +94,36 @@ pub async fn ssh_connect_direct_impl(
             ))]));
         }
         Err(e) => {
-            // SSH keys failed, try password if provided
-            let debug =
-                std::env::var("SSH_LIAISON_DEBUG").unwrap_or_else(|_| "0".to_string()) == "1";
-            if debug {
-                eprintln!(
-                    "[DEBUG] SSH key authentication failed: {}, trying password...",
-                    e
+            tracing::debug!(error = %e, "SSH key authentication failed, trying password");
+        }
+    }
+
+    if let Some(ref password) = p.password
+        && !password.is_empty()
+    {
+        match session_manager
+            .connect_with_password(&p.host_alias, &p.user, &p.hostname, password, p.port)
+            .await
+        {
+            Ok(()) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Successfully connected to {}@{} using password",
+                    p.user, p.hostname
+                ))]));
+            }
+            Err(e) => {
+                let msg = Box::leak(
+                    format!(
+                        "Authentication failed: SSH keys and password both failed. Last error: {}",
+                        e
+                    )
+                    .into_boxed_str(),
                 );
+                return Err(McpError::invalid_params(&*msg, None));
             }
         }
     }
 
-    // Try password authentication if password is provided and not empty
-    if let Some(ref password) = p.password {
-        if !password.is_empty() {
-            match session_manager
-                .connect_with_password(&p.host_alias, &p.user, &p.hostname, password, p.port)
-                .await
-            {
-                Ok(()) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Successfully connected to {}@{} using password",
-                        p.user, p.hostname
-                    ))]));
-                }
-                Err(e) => {
-                    let msg = Box::leak(format!("Authentication failed: SSH keys and password both failed. Last error: {}", e).into_boxed_str());
-                    return Err(McpError::invalid_params(&*msg, None));
-                }
-            }
-        }
-    }
-
-    // No password provided and SSH keys failed
     let msg = Box::leak(
         "SSH key authentication failed and no password provided"
             .to_string()
@@ -139,41 +138,15 @@ pub async fn ssh_run_command_impl(
 ) -> Result<CallToolResult, McpError> {
     let host = &params.0.host;
     let command = &params.0.command;
+    let sudo_password = params.0.sudo_password.as_deref();
 
-    // Check for sudo password prompt in command
-    if command.contains("sudo") {
-        // Note: Full elicitation support would be added here
-        // For now, we'll execute and detect password prompts in output
-    }
-
-    match session_manager.execute_command(host, command).await {
-        Ok(output) => {
-            // Check for sudo password prompt in both stdout and stderr
-            let combined = output.combined();
-            if combined.contains("[sudo] password") || combined.contains("Password:") {
-                // In a full implementation, this would trigger elicitation
-                // For now, return an error suggesting the user handle it manually
-                return Err(McpError::invalid_params(
-                    "Command requires sudo password. Elicitation support coming soon. Please ensure the user has passwordless sudo configured or handle manually.",
-                    None,
-                ));
-            }
-
-            // Combine stdout and stderr for MCP response
-            let mut result_text = String::new();
-            if !output.stdout.trim().is_empty() {
-                result_text.push_str(&output.stdout);
-            }
-            if !output.stderr.trim().is_empty() {
-                if !result_text.is_empty() && !result_text.ends_with('\n') {
-                    result_text.push('\n');
-                }
-                result_text.push_str("STDERR:\n");
-                result_text.push_str(&output.stderr);
-            }
-
-            Ok(CallToolResult::success(vec![Content::text(result_text)]))
-        }
+    match session_manager
+        .execute_command(host, command, sudo_password)
+        .await
+    {
+        Ok(output) => Ok(CallToolResult::success(vec![Content::text(
+            output.combined_with_stderr_label(),
+        )])),
         Err(e) => {
             let msg = Box::leak(e.to_string().into_boxed_str());
             Err(McpError::invalid_params(&*msg, None))
@@ -191,23 +164,10 @@ pub async fn ssh_read_log_impl(
 
     let command = format!("tail -n {} {}", lines, file_path);
 
-    match session_manager.execute_command(host, &command).await {
-        Ok(output) => {
-            // Combine stdout and stderr for MCP response
-            let mut result_text = String::new();
-            if !output.stdout.trim().is_empty() {
-                result_text.push_str(&output.stdout);
-            }
-            if !output.stderr.trim().is_empty() {
-                if !result_text.is_empty() && !result_text.ends_with('\n') {
-                    result_text.push('\n');
-                }
-                result_text.push_str("STDERR:\n");
-                result_text.push_str(&output.stderr);
-            }
-
-            Ok(CallToolResult::success(vec![Content::text(result_text)]))
-        }
+    match session_manager.execute_command(host, &command, None).await {
+        Ok(output) => Ok(CallToolResult::success(vec![Content::text(
+            output.combined_with_stderr_label(),
+        )])),
         Err(e) => {
             let msg = Box::leak(e.to_string().into_boxed_str());
             Err(McpError::invalid_params(&*msg, None))

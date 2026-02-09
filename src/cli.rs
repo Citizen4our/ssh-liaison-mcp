@@ -13,33 +13,30 @@ pub async fn run_cli_mode(
     let manager = SessionManager::new();
     let mut current_host: Option<String> = None;
 
-    // Connect immediately if credentials provided
     if let (Some(user), Some(hostname)) = (user, hostname) {
         let alias = host_alias.as_deref().unwrap_or("direct");
-        eprintln!("Connecting to {}@{}:{}...", user, hostname, port);
+        tracing::info!(user = %user, hostname = %hostname, port = %port, "Connecting");
 
-        // Try SSH key authentication first (standard SSH behavior)
-        let mut connected = false;
         match manager
             .connect_direct(alias, &user, &hostname, Some(port))
             .await
         {
             Ok(()) => {
-                eprintln!("Connected successfully using SSH keys!");
-                connected = true;
+                tracing::info!("Connected using SSH keys");
+                current_host = Some(alias.to_string());
             }
             Err(e) => {
-                eprintln!("SSH key authentication failed: {}", e);
+                tracing::warn!(error = %e, "SSH key authentication failed");
                 if let Some(pass) = password {
                     if !pass.is_empty() {
-                        eprintln!("Trying password authentication...");
+                        tracing::info!("Trying password authentication");
                         match manager
                             .connect_with_password(alias, &user, &hostname, &pass, Some(port))
                             .await
                         {
                             Ok(()) => {
-                                eprintln!("Connected successfully using password!");
-                                connected = true;
+                                tracing::info!("Connected using password");
+                                current_host = Some(alias.to_string());
                             }
                             Err(e2) => {
                                 anyhow::bail!(
@@ -72,25 +69,20 @@ pub async fn run_cli_mode(
                 }
             }
         }
-
-        current_host = Some(alias.to_string());
     } else if let Some(ref alias) = host_alias {
-        // Connect using SSH config alias
-        eprintln!("Connecting to {}...", alias);
+        tracing::info!(alias = %alias, "Connecting");
         manager
             .connect_by_alias(alias)
             .await
             .with_context(|| format!("Failed to connect to '{}'", alias))?;
-        eprintln!("Connected successfully!");
+        tracing::info!("Connected successfully");
         current_host = Some(alias.clone());
     }
 
-    // Use blocking stdin for CLI mode (simpler for interactive use)
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
 
     loop {
-        // Show prompt
         if let Some(ref alias) = current_host {
             print!("[{}]> ", alias);
         } else {
@@ -98,7 +90,6 @@ pub async fn run_cli_mode(
         }
         io::stdout().flush()?;
 
-        // Read command
         let mut input = String::new();
         reader.read_line(&mut input)?;
         let command = input.trim();
@@ -107,7 +98,6 @@ pub async fn run_cli_mode(
             continue;
         }
 
-        // Handle special commands
         match command {
             "exit" | "quit" => {
                 if let Some(ref alias) = current_host {
@@ -118,7 +108,7 @@ pub async fn run_cli_mode(
             "disconnect" => {
                 if let Some(ref alias) = current_host {
                     manager.disconnect(alias).await?;
-                    eprintln!("Disconnected from {}", alias);
+                    tracing::info!(host = %alias, "Disconnected");
                     current_host = None;
                 } else {
                     eprintln!("Not connected to any host");
@@ -137,7 +127,6 @@ pub async fn run_cli_mode(
                     let _ = manager.disconnect(old_alias).await;
                 }
 
-                // Try direct connection format: connect user hostname [password] [port]
                 if args.len() >= 2 {
                     let user = args[0];
                     let hostname = args[1];
@@ -147,25 +136,22 @@ pub async fn run_cli_mode(
                         .and_then(|p| p.parse::<u16>().ok())
                         .unwrap_or(22);
 
-                    eprintln!("Connecting to {}@{}:{}...", user, hostname, port);
+                    tracing::info!(user = %user, hostname = %hostname, port = %port, "Connecting");
                     let alias = format!("{}_{}", user, hostname);
 
-                    // Try SSH key authentication first (standard SSH behavior)
-                    let mut connected = false;
                     match manager
                         .connect_direct(&alias, user, hostname, Some(port))
                         .await
                     {
                         Ok(()) => {
-                            eprintln!("Connected successfully using SSH keys!");
+                            tracing::info!("Connected using SSH keys");
                             current_host = Some(alias.clone());
-                            connected = true;
                         }
                         Err(e) => {
-                            eprintln!("SSH key authentication failed: {}", e);
+                            tracing::warn!(error = %e, "SSH key authentication failed");
                             if let Some(pass) = password {
                                 if !pass.is_empty() {
-                                    eprintln!("Trying password authentication...");
+                                    tracing::info!("Trying password authentication");
                                     match manager
                                         .connect_with_password(
                                             &alias,
@@ -177,36 +163,35 @@ pub async fn run_cli_mode(
                                         .await
                                     {
                                         Ok(()) => {
-                                            eprintln!("Connected successfully using password!");
+                                            tracing::info!("Connected using password");
                                             current_host = Some(alias);
-                                            connected = true;
                                         }
                                         Err(e2) => {
-                                            eprintln!(
-                                                "Connection failed: SSH keys failed: {}, password failed: {}",
-                                                e, e2
+                                            tracing::error!(
+                                                ssh_error = %e,
+                                                password_error = %e2,
+                                                "Connection failed"
                                             );
                                         }
                                     }
                                 } else {
-                                    eprintln!("Connection failed: {}", e);
+                                    tracing::error!(error = %e, "Connection failed");
                                 }
                             } else {
-                                eprintln!("Connection failed: {}", e);
+                                tracing::error!(error = %e, "Connection failed");
                             }
                         }
                     }
                 } else {
-                    // SSH config alias
                     let alias = args[0];
-                    eprintln!("Connecting to {}...", alias);
+                    tracing::info!(alias = %alias, "Connecting");
                     match manager.connect_by_alias(alias).await {
                         Ok(()) => {
-                            eprintln!("Connected successfully!");
+                            tracing::info!("Connected successfully");
                             current_host = Some(alias.to_string());
                         }
                         Err(e) => {
-                            eprintln!("Connection failed: {}", e);
+                            tracing::error!(error = %e, "Connection failed");
                         }
                     }
                 }
@@ -215,18 +200,15 @@ pub async fn run_cli_mode(
             _ => {}
         }
 
-        // Execute command on remote host
         if let Some(ref alias) = current_host {
-            match manager.execute_command(alias, command).await {
+            match manager.execute_command(alias, command, None).await {
                 Ok(output) => {
-                    // Output stdout
                     if !output.stdout.trim().is_empty() {
                         print!("{}", output.stdout.trim_end());
                         if !output.stdout.trim_end().ends_with('\n') {
                             println!();
                         }
                     }
-                    // Output stderr
                     if !output.stderr.trim().is_empty() {
                         eprint!("{}", output.stderr.trim_end());
                         if !output.stderr.trim_end().ends_with('\n') {
@@ -235,7 +217,7 @@ pub async fn run_cli_mode(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    tracing::error!(error = %e, "Command execution failed");
                 }
             }
         } else {

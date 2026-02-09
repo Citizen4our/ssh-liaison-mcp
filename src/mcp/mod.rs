@@ -17,6 +17,12 @@ pub struct SshMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+impl Default for SshMcpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SshMcpServer {
     pub fn new() -> Self {
         let session_manager = SessionManager::new();
@@ -53,7 +59,7 @@ impl SshMcpServer {
 
     #[tool(
         name = "ssh_run_command",
-        description = "Execute a command on a connected SSH host. Commands run in a persistent shell session, so state (like current directory) is preserved between commands. WARNING: Destructive operations (rm, mv, etc.) should be avoided. Prefer read-only commands."
+        description = "Execute a command on a connected SSH host. Commands run in a persistent shell session, so state (like current directory) is preserved between commands. Use sudo_password for commands that require sudo. 30s timeout. IMPORTANT: Use --no-pager for systemctl, journalctl, git log, etc., otherwise output will hang. Avoid interactive/pager commands (less, vim, top, htop) — they will hang. For commands that produce no stdout (e.g. systemctl restart): if timeout occurs, append `&& echo` or `; echo` to force output. WARNING: Destructive operations (rm, mv, etc.) should be avoided. Prefer read-only commands."
     )]
     pub async fn ssh_run_command(
         &self,
@@ -94,55 +100,48 @@ impl rmcp::ServerHandler for SshMcpServer {
 pub async fn run_mcp_server() -> Result<()> {
     use std::io::Write;
 
-    // Log startup information to stderr (stdout is used for MCP protocol)
     let version = env!("CARGO_PKG_VERSION");
     let name = env!("CARGO_PKG_NAME");
 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("🚀 {} v{}", name, version);
+    eprintln!("{} v{}", name, version);
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("📡 MCP Server starting...");
-    eprintln!("");
-    eprintln!("📦 Available tools:");
-    eprintln!("   • ssh_connect         - Connect to SSH host via ~/.ssh/config");
-    eprintln!("   • ssh_connect_direct   - Connect to SSH host directly (user/host/password)");
-    eprintln!("   • ssh_run_command     - Execute commands on connected host");
-    eprintln!("   • ssh_read_log        - Read log files from remote host");
-    eprintln!("");
-    eprintln!("💡 Usage in Cursor/Claude:");
-    eprintln!("   Ask AI to connect to a host and run commands");
-    eprintln!("   Example: \"Connect to rpi and show disk usage\"");
-    eprintln!("");
-    eprintln!("⚠️  Security: Prefer read-only operations");
+    eprintln!("MCP Server starting...");
+    eprintln!();
+    eprintln!("Available tools:");
+    eprintln!("  - ssh_connect        Connect to SSH host via ~/.ssh/config");
+    eprintln!("  - ssh_connect_direct Connect to SSH host directly");
+    eprintln!("  - ssh_run_command    Execute commands on connected host");
+    eprintln!("  - ssh_read_log       Read log files from remote host");
+    eprintln!();
+    eprintln!("Security: Prefer read-only operations");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("✅ Server ready, waiting for MCP requests...");
-    eprintln!("");
+    eprintln!("Server ready, waiting for MCP requests...");
+    eprintln!();
     std::io::stderr().flush()?;
 
     let server = SshMcpServer::new();
     let service = match server.serve(stdio()).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("❌ Failed to start MCP server: {}", e);
+            tracing::error!(error = %e, "Failed to start MCP server");
             return Err(e.into());
         }
     };
 
-    // Wait for service to complete (or be interrupted)
     match service.waiting().await {
         Ok(_) => {
-            eprintln!("");
-            eprintln!("👋 Server shutting down gracefully...");
+            eprintln!();
+            eprintln!("Server shutting down gracefully...");
         }
         Err(e) => {
-            // Don't show connection closed errors - they're normal when client disconnects
             let err_msg = e.to_string();
             if !err_msg.contains("connection closed") && !err_msg.contains("broken pipe") {
-                eprintln!("");
-                eprintln!("⚠️  Server error: {}", e);
+                eprintln!();
+                tracing::warn!(error = %e, "Server error");
             } else {
-                eprintln!("");
-                eprintln!("👋 Client disconnected, shutting down...");
+                eprintln!();
+                eprintln!("Client disconnected, shutting down...");
             }
         }
     }

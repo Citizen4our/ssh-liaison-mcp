@@ -27,27 +27,14 @@ fn generate_marker() -> String {
     format!("__SSH_CMD_DONE_{}__", timestamp)
 }
 
-/// Output from an executed SSH command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandOutput {
-    /// Standard output from the command.
     pub stdout: String,
-    /// Standard error output from the command.
     pub stderr: String,
 }
 
-impl Default for CommandOutput {
-    fn default() -> Self {
-        Self {
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-}
-
 impl CommandOutput {
-    /// Returns combined stdout and stderr, with proper newline handling.
-    pub fn combined(&self) -> String {
+    pub fn combined_with_stderr_label(&self) -> String {
         let mut result = String::new();
         if !self.stdout.trim().is_empty() {
             result.push_str(&self.stdout);
@@ -56,28 +43,31 @@ impl CommandOutput {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
             }
+            result.push_str("STDERR:\n");
             result.push_str(&self.stderr);
         }
         result
     }
 }
 
-/// Persistent shell channel for executing commands over SSH.
-///
-/// Maintains shell state (current directory, environment variables) between commands.
 pub struct ShellChannel {
     channel: AsyncChannel<TokioTcpStream>,
 }
 
-fn find_last_marker_position(output: &str, marker: &str) -> Option<usize> {
-    let mut last_marker_pos = None;
+/// Marker on own line (preceded by \n or at start) — ignores echoed command, truncates at real marker.
+fn find_last_marker_on_own_line(output: &str, marker: &str) -> Option<usize> {
+    let mut last_pos = None;
     let mut search_pos = 0;
     while let Some(pos) = output[search_pos..].find(marker) {
         let abs_pos = search_pos + pos;
-        last_marker_pos = Some(abs_pos);
+        let at_line_start =
+            abs_pos == 0 || output.as_bytes().get(abs_pos.wrapping_sub(1)) == Some(&b'\n');
+        if at_line_start {
+            last_pos = Some(abs_pos);
+        }
         search_pos = abs_pos + marker.len();
     }
-    last_marker_pos
+    last_pos
 }
 
 fn remove_command_echo(output: &mut String, command: &str, marker: &str) {
@@ -88,45 +78,25 @@ fn remove_command_echo(output: &mut String, command: &str, marker: &str) {
 }
 
 impl ShellChannel {
-    /// Creates a new `ShellChannel` from an SSH channel.
     pub fn new(channel: AsyncChannel<TokioTcpStream>) -> Self {
         Self { channel }
     }
 
-    /// Executes a command on the remote shell and returns its output.
-    ///
-    /// Uses a unique marker to detect command completion. The marker is appended
-    /// to the command and detected in the output stream to determine when execution finishes.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - The shell command to execute
-    ///
-    /// # Returns
-    ///
-    /// Returns `CommandOutput` containing stdout and stderr. In PTY mode, stderr
-    /// is typically empty as streams are merged.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command times out, the channel fails, or I/O errors occur.
-    pub async fn execute_command(&mut self, command: &str) -> Result<CommandOutput> {
-        let debug = std::env::var("SSH_LIAISON_DEBUG").unwrap_or_else(|_| "0".to_string()) == "1";
-
+    pub async fn execute_command(
+        &mut self,
+        command: &str,
+        sudo_password: Option<&str>,
+    ) -> Result<CommandOutput> {
         let marker = generate_marker();
         let full_command = format!("{}; echo {}\n", command, marker);
 
-        if debug {
-            eprintln!("[DEBUG] Executing command: {}", command);
-            eprintln!("[DEBUG] Full command with marker: {}", full_command.trim());
-        }
+        tracing::debug!(command = %command, "Executing command");
+        tracing::trace!(full_command = %full_command.trim(), "Full command with marker");
 
         self.channel.write_all(full_command.as_bytes()).await?;
         self.channel.flush().await?;
 
-        if debug {
-            eprintln!("[DEBUG] Command sent, starting to read...");
-        }
+        tracing::trace!("Command sent, starting to read");
 
         let mut stdout = String::new();
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
@@ -134,12 +104,11 @@ impl ShellChannel {
         let mut marker_found = false;
         let mut last_read_time = Instant::now();
         let mut no_data_count = 0;
+        let mut sudo_password_sent = false;
 
         loop {
             if start.elapsed() > COMMAND_TIMEOUT {
-                if debug {
-                    eprintln!("[DEBUG] TIMEOUT after {:?}", start.elapsed());
-                }
+                tracing::warn!(elapsed = ?start.elapsed(), "Command timeout");
                 anyhow::bail!("Command timeout after {:?}", COMMAND_TIMEOUT);
             }
 
@@ -155,9 +124,7 @@ impl ShellChannel {
                             }
                             no_data_count += 1;
                             if no_data_count > NO_DATA_THRESHOLD && last_read_time.elapsed() > Duration::from_millis(IDLE_TIMEOUT_MS) {
-                                if debug {
-                                    eprintln!("[DEBUG] No data for {}ms, assuming command completed", IDLE_TIMEOUT_MS);
-                                }
+                                tracing::trace!(idle_ms = IDLE_TIMEOUT_MS, "No data, assuming command completed");
                                 break;
                             }
                             sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await;
@@ -166,19 +133,30 @@ impl ShellChannel {
                             last_read_time = Instant::now();
                             no_data_count = 0;
                             let chunk = String::from_utf8_lossy(&buffer[..n]);
-                            if debug {
-                                eprintln!("[DEBUG] Read {} bytes: {:?}", n, chunk.chars().take(100).collect::<String>());
-                            }
+                            tracing::trace!(bytes = n, "Read data");
                             stdout.push_str(&chunk);
 
-                            if let Some(marker_pos) = stdout.find(&marker) {
-                                if debug {
-                                    eprintln!("[DEBUG] Marker found at position {}", marker_pos);
+                            let sudo_prompt = stdout.contains("[sudo] password")
+                                || stdout.contains("Password:");
+                            if sudo_prompt && !sudo_password_sent {
+                                if let Some(pass) = sudo_password {
+                                    tracing::trace!("Sudo password prompt detected, sending response");
+                                    self.channel
+                                        .write_all(format!("{}\n", pass).as_bytes())
+                                        .await?;
+                                    self.channel.flush().await?;
+                                    sudo_password_sent = true;
+                                } else {
+                                    anyhow::bail!(
+                                        "Command requires sudo password. Elicitation support coming soon. \
+                                        Please ensure the user has passwordless sudo configured or handle manually."
+                                    );
                                 }
+                            }
 
-                                // Continue reading to capture all output after initial marker detection.
-                                // The marker may appear in the command echo, but the actual completion
-                                // marker comes after command execution.
+                            if let Some(marker_pos) = find_last_marker_on_own_line(&stdout, &marker) {
+                                tracing::trace!(position = marker_pos, "Marker found");
+
                                 let mut continue_reading = true;
                                 let mut read_attempts = 0;
 
@@ -206,10 +184,8 @@ impl ShellChannel {
                                     }
                                 }
 
-                                if let Some(pos) = find_last_marker_position(&stdout, &marker) {
-                                    if debug {
-                                        eprintln!("[DEBUG] Using last marker at position {}, total len={}", pos, stdout.len());
-                                    }
+                                if let Some(pos) = find_last_marker_on_own_line(&stdout, &marker) {
+                                    tracing::trace!(position = pos, total_len = stdout.len(), "Using marker on own line");
                                     stdout.truncate(pos);
                                     remove_command_echo(&mut stdout, command, &marker);
                                     marker_found = true;
@@ -218,9 +194,7 @@ impl ShellChannel {
                             }
                         }
                         Err(e) => {
-                            if debug {
-                                eprintln!("[DEBUG] Read error: {:?}", e);
-                            }
+                            tracing::trace!(error = %e, "Read error");
                             sleep(Duration::from_millis(SLEEP_ON_ERROR_MS)).await;
                         }
                     }
@@ -230,22 +204,18 @@ impl ShellChannel {
                         break;
                     }
                     if last_read_time.elapsed() > Duration::from_millis(IDLE_TIMEOUT_MS) && no_data_count > 5 {
-                        if debug {
-                            eprintln!("[DEBUG] No data for {}ms, breaking", IDLE_TIMEOUT_MS);
-                        }
+                        tracing::trace!(idle_ms = IDLE_TIMEOUT_MS, "No data, breaking");
                         break;
                     }
                 }
             }
         }
 
-        if debug {
-            eprintln!(
-                "[DEBUG] Loop finished, stdout.len={}, marker_found={}",
-                stdout.len(),
-                marker_found
-            );
-        }
+        tracing::trace!(
+            stdout_len = stdout.len(),
+            marker_found = marker_found,
+            "Loop finished"
+        );
 
         let cleaned = clean_ansi_sequences(&stdout);
 
@@ -278,18 +248,6 @@ fn clean_ansi_sequences(text: &str) -> String {
 }
 
 impl ShellChannel {
-    /// Executes a command and streams output to stdout in real-time.
-    ///
-    /// Similar to `execute_command`, but prints output as it arrives rather than
-    /// collecting it all before returning.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - The shell command to execute
-    ///
-    /// # Returns
-    ///
-    /// Returns the accumulated stdout output as a string.
     #[allow(dead_code)]
     pub async fn execute_command_streaming(&mut self, command: &str) -> Result<String> {
         let marker = generate_marker();
@@ -336,7 +294,6 @@ impl ShellChannel {
         Ok(stdout_accumulated)
     }
 
-    /// Writes data directly to the shell channel.
     #[allow(dead_code)]
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
         self.channel.write_all(data).await?;
@@ -344,7 +301,6 @@ impl ShellChannel {
         Ok(())
     }
 
-    /// Closes the shell channel.
     pub async fn close(mut self) -> Result<()> {
         self.channel.close().await?;
         Ok(())

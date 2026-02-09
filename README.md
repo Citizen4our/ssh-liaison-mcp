@@ -4,9 +4,10 @@
 
 **Stateful SSH connection and command execution via Model Context Protocol (MCP)**
 
-[![Rust](https://img.shields.io/badge/rust-1.0+-orange.svg)](https://www.rust-lang.org/)
+[![CI](https://github.com/Citizen4our/ssh-liaison-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Citizen4our/ssh-liaison-mcp/actions/workflows/ci.yml)
+[![Release](https://github.com/Citizen4our/ssh-liaison-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/Citizen4our/ssh-liaison-mcp/releases)
+[![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Citizen4our/ssh-liaison-mcp)
 
 </div>
 
@@ -26,10 +27,33 @@
 
 ## 📦 Installation
 
+### Pre-built Binaries
+
+Download the latest release for your platform from the [Releases page](https://github.com/Citizen4our/ssh-liaison-mcp/releases).
+
+**Available platforms:**
+- macOS (Intel x86_64, Apple Silicon aarch64)
+- Linux (x86_64, aarch64)
+- Windows (x86_64)
+
+```bash
+# macOS (Apple Silicon)
+curl -LO https://github.com/Citizen4our/ssh-liaison-mcp/releases/latest/download/ssh-liaison-mcp-aarch64-apple-darwin.tar.gz
+tar -xzf ssh-liaison-mcp-aarch64-apple-darwin.tar.gz
+
+# macOS (Intel)
+curl -LO https://github.com/Citizen4our/ssh-liaison-mcp/releases/latest/download/ssh-liaison-mcp-x86_64-apple-darwin.tar.gz
+tar -xzf ssh-liaison-mcp-x86_64-apple-darwin.tar.gz
+
+# Linux (x86_64)
+curl -LO https://github.com/Citizen4our/ssh-liaison-mcp/releases/latest/download/ssh-liaison-mcp-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf ssh-liaison-mcp-x86_64-unknown-linux-gnu.tar.gz
+```
+
 ### Build from Source
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Citizen4our/ssh-liaison-mcp.git
 cd ssh-liaison-mcp
 cargo build --release
 ```
@@ -396,6 +420,47 @@ cargo build --release
 
 # Run tests
 cargo test
+
+# Run lints
+cargo clippy --all-targets -- -D warnings
+
+# Format code
+cargo fmt
+```
+
+---
+
+## 📊 Logging
+
+The server uses structured logging via the `tracing` crate. Control log verbosity with:
+
+### Command-line flags
+
+```bash
+# Default (warnings only)
+ssh-liaison-mcp serve
+
+# Info level (-v)
+ssh-liaison-mcp -v serve
+
+# Debug level (-vv)
+ssh-liaison-mcp -vv serve
+
+# Trace level (-vvv)
+ssh-liaison-mcp -vvv serve
+```
+
+### Environment variable
+
+```bash
+# Set log level via RUST_LOG
+RUST_LOG=debug ssh-liaison-mcp serve
+
+# Target specific modules
+RUST_LOG=ssh_liaison_mcp=debug ssh-liaison-mcp serve
+
+# Multiple targets
+RUST_LOG=ssh_liaison_mcp::ssh=trace,ssh_liaison_mcp::mcp=debug ssh-liaison-mcp serve
 ```
 
 ---
@@ -404,20 +469,20 @@ cargo test
 
 ### Infrastructure & Distribution
 
-- [ ] **CI/CD Pipeline (GitHub Actions)**
-  - [ ] Automated tests on push/PR
-  - [ ] Linting and formatting checks (clippy, rustfmt)
-  - [ ] Build for multiple platforms (Linux, macOS, Windows)
-  - [ ] Automated release workflow
+- [x] **CI/CD Pipeline (GitHub Actions)**
+  - [x] Automated tests on push/PR
+  - [x] Linting and formatting checks (clippy, rustfmt)
+  - [x] Build for multiple platforms (Linux, macOS, Windows)
+  - [x] Automated release workflow
 
-- [ ] **Release Automation**
-  - [ ] GitHub Actions workflow for creating releases
-  - [ ] Automatic binary builds for major platforms
-  - [ ] GitHub Releases with pre-built binaries
+- [x] **Release Automation**
+  - [x] GitHub Actions workflow for creating releases
+  - [x] Automatic binary builds for major platforms
+  - [x] GitHub Releases with pre-built binaries
   - [ ] Version bumping automation
 
 - [ ] **Crates.io Publication**
-  - [ ] Prepare crate metadata (description, keywords, categories)
+  - [x] Prepare crate metadata (description, keywords, categories)
   - [ ] Add crate documentation
   - [ ] Publish to crates.io
 
@@ -454,7 +519,7 @@ cargo test
 ### Code Quality
 
 - [ ] **Testing**
-  - [ ] Unit tests for SSH session management
+  - [x] Unit tests for SSH config parsing
   - [ ] Integration tests for MCP tools
   - [ ] Mock SSH server for testing
   - [ ] CLI mode tests
@@ -465,18 +530,18 @@ cargo test
   - [ ] Contributing guidelines
   - [ ] Security best practices guide
 
-- [ ] **Code Improvements**
-  - [ ] Refactor error handling patterns
-  - [ ] Add more comprehensive logging
+- [x] **Code Improvements**
+  - [x] Refactor error handling patterns
+  - [x] Add comprehensive logging (tracing)
   - [ ] Performance optimizations
   - [ ] Code coverage improvements
 
 ### Platform Support
 
-- [ ] **Cross-platform Binary Releases**
-  - [ ] Linux (x86_64, ARM64)
-  - [ ] macOS (Intel, Apple Silicon)
-  - [ ] Windows (if feasible with SSH2 library)
+- [x] **Cross-platform Binary Releases**
+  - [x] Linux (x86_64, ARM64)
+  - [x] macOS (Intel, Apple Silicon)
+  - [x] Windows (x86_64)
 
 - [ ] **Package Managers**
   - [ ] Homebrew formula for macOS
