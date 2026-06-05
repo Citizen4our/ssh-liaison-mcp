@@ -175,11 +175,18 @@ When running as MCP server, the following tools are available:
 |------|-------------|------------|
 | **ssh_connect** | Connect to remote SSH server and establish a **persistent shell session**. The session maintains state between subsequent command calls. | `host_alias` (string) - Host alias defined in SSH config |
 | **ssh_connect_direct** | Connect to remote SSH server directly using user, hostname/IP, optional password, and optional port. Establishes a **persistent shell session** that maintains state between subsequent command calls. Authentication tries SSH keys first, then password if provided. | `host_alias` (string) - Host alias to identify this connection, `user` (string) - SSH username, `hostname` (string) - Hostname or IP address, `password` (string, optional) - SSH password (if SSH keys fail or not available), `port` (integer, optional) - SSH port (default: 22) |
-| **ssh_run_command** | Execute command on connected host in the **same persistent shell session**. Current directory, environment variables, and shell state are preserved from previous commands. | `host` (string) - Host alias, `command` (string) - Command to execute |
-| **ssh_read_log** | Read last N lines from log file using the persistent shell session. | `host` (string) - Host alias, `file_path` (string) - Path to log file, `lines` (integer) - Number of lines to read |
+| **ssh_run_command** | Execute command in a persistent shell. Auto-connects via SSH config or a registered direct profile. Idle/max timeouts configurable. | `host`, `command`, optional `sudo_password`, `timeout_secs`, `max_timeout_secs` |
+| **ssh_run_detached** | Run a long command in the background (tmux or native). Returns `job_id`. | `host`, `command` |
+| **ssh_job_status** | Non-blocking status and new output of a detached job. | `host`, `job_id` |
+| **ssh_job_wait** | Block until job finishes or timeout. | `host`, `job_id`, optional `timeout_secs` |
+| **ssh_job_signal** | Send `int`, `term`, or `kill` to a detached job worker. | `host`, `job_id`, `signal` |
+| **ssh_read_log** | Read last N lines from a log file. Auto-connects when needed. | `host`, `file_path`, `lines` |
 
 **Important Notes:**
-- **Stateful**: All commands for the same host run in the same persistent shell session
+- **Stateful (same MCP process)**: Commands for the same host share one shell session; `cd` and env persist until the MCP server process restarts.
+- **Auto-connect**: `ssh_run_command`, detached tools, and `ssh_read_log` connect automatically via `~/.ssh/config` or a profile saved by `ssh_connect_direct` in the same process.
+- **Multi-process MCP clients**: Each tool call may run in a fresh process — shell state does not carry over, but auto-connect still works for SSH-config and direct profiles registered in that process.
+- **Long commands**: Prefer `ssh_run_detached` when runtime may exceed command timeouts.
 - **Connection Methods**: 
   - Use `ssh_connect` for SSH config-based connections (requires `~/.ssh/config`)
   - Use `ssh_connect_direct` for direct connections without SSH config requirement
@@ -489,10 +496,8 @@ RUST_LOG=ssh_liaison_mcp::ssh=trace,ssh_liaison_mcp::mcp=debug ssh-liaison-mcp s
 ### Features
 
 - [ ] **Sudo Password Elicitation**
-  - [ ] Implement password prompt handling for sudo commands
-  - [ ] Secure password input via MCP prompts
+  - [ ] MCP prompt when password not provided (interactive elicitation)
   - [ ] Password caching for session duration
-
 
 - [ ] **Session Management**
   - [ ] `ssh_disconnect` tool to explicitly close sessions
@@ -546,7 +551,6 @@ RUST_LOG=ssh_liaison_mcp::ssh=trace,ssh_liaison_mcp::mcp=debug ssh-liaison-mcp s
 - [ ] **Package Managers**
   - [ ] Homebrew formula for macOS
   - [ ] AUR package for Arch Linux
-  - [ ] Cargo install instructions
 
 ### Security Enhancements
 

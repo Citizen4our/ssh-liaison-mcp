@@ -1,20 +1,61 @@
 use anyhow::{Context, Result};
-use async_ssh2_lite::{AsyncSession, TokioTcpStream};
+use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::channel::ShellChannel;
+use super::channel::{CommandTimeouts, ShellChannel};
 use super::config::{SshHostConfig, parse_ssh_config};
+use super::error::SshCommandError;
+use super::jobs::{self, JobSignal, JobState};
+
+const KEEPALIVE_INTERVAL_SECS: u32 = 30;
+const JOB_POLL_INTERVAL_MS: u64 = 1000;
+
+#[derive(Debug, Clone)]
+struct DirectProfile {
+    user: String,
+    hostname: String,
+    port: Option<u16>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JobMeta {
+    host: String,
+    read_bytes: u64,
+    use_tmux: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobReport {
+    pub job_id: String,
+    pub state: JobState,
+    pub output: String,
+    pub timed_out: bool,
+}
+
+fn connect_config() -> SessionConfiguration {
+    let mut config = SessionConfiguration::new();
+    config.set_keepalive(true, KEEPALIVE_INTERVAL_SECS);
+    config
+}
 
 pub struct SessionState {
     session: AsyncSession<TokioTcpStream>,
     channel: ShellChannel,
 }
 
+struct ManagedSession {
+    inner: Mutex<SessionState>,
+}
+
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<ManagedSession>>>>,
+    jobs: Arc<Mutex<HashMap<String, JobMeta>>>,
+    tmux_cache: Arc<Mutex<HashMap<String, bool>>>,
+    direct_profiles: Arc<Mutex<HashMap<String, DirectProfile>>>,
 }
 
 impl Default for SessionManager {
@@ -27,12 +68,66 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            tmux_cache: Arc::new(Mutex::new(HashMap::new())),
+            direct_profiles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn connect_by_alias(&self, host_alias: &str) -> Result<()> {
         let config = parse_ssh_config(host_alias)?;
         self.connect_with_config(host_alias, &config).await
+    }
+
+    async fn initialize_shell(state: &mut SessionState) -> Result<()> {
+        state.channel.drain_pending(2000).await;
+        state
+            .channel
+            .send_raw("stty -echo 2>/dev/null; set +e\n")
+            .await
+            .map_err(|e| anyhow::anyhow!("Shell init failed: {e}"))?;
+        state.channel.drain_pending(500).await;
+        Ok(())
+    }
+
+    async fn open_shell_session(session: AsyncSession<TokioTcpStream>) -> Result<SessionState> {
+        let mut channel = session
+            .channel_session()
+            .await
+            .context("Failed to open channel")?;
+
+        channel
+            .request_pty("dumb", None, None)
+            .await
+            .context("Failed to request PTY")?;
+
+        channel.shell().await.context("Failed to open shell")?;
+
+        Ok(SessionState {
+            session,
+            channel: ShellChannel::new(channel),
+        })
+    }
+
+    async fn insert_session(&self, host_alias: &str, state: SessionState) {
+        self.evict(host_alias).await;
+        let managed = Arc::new(ManagedSession {
+            inner: Mutex::new(state),
+        });
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(host_alias.to_string(), managed);
+    }
+
+    async fn evict(&self, host_alias: &str) {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(host_alias)
+        };
+        if let Some(managed) = removed {
+            let mut state = managed.inner.lock().await;
+            let _ = state.channel.shutdown().await;
+            let _ = state.session.disconnect(None, "Goodbye", None).await;
+        }
     }
 
     pub async fn connect_with_config(
@@ -61,7 +156,7 @@ impl SessionManager {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No address found for {}", hostname))?;
 
-        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, None)
+        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, connect_config())
             .await
             .context("Failed to connect")?;
 
@@ -209,27 +304,9 @@ impl SessionManager {
             anyhow::bail!("Authentication failed for {}@{}", user, hostname);
         }
 
-        let mut channel = session
-            .channel_session()
-            .await
-            .context("Failed to open channel")?;
-
-        channel
-            .request_pty("xterm", None, None)
-            .await
-            .context("Failed to request PTY")?;
-
-        channel.shell().await.context("Failed to open shell")?;
-
-        let shell_channel = ShellChannel::new(channel);
-
-        let state = SessionState {
-            session,
-            channel: shell_channel,
-        };
-
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(host_alias.to_string(), state);
+        let mut state = Self::open_shell_session(session).await?;
+        Self::initialize_shell(&mut state).await?;
+        self.insert_session(host_alias, state).await;
 
         Ok(())
     }
@@ -269,7 +346,7 @@ impl SessionManager {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No address found for {}", host))?;
 
-        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, None)
+        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, connect_config())
             .await
             .context("Failed to connect")?;
 
@@ -284,35 +361,70 @@ impl SessionManager {
             anyhow::bail!("Authentication failed for {}@{}", user, host);
         }
 
-        let mut channel = session
-            .channel_session()
-            .await
-            .context("Failed to open channel")?;
-
-        channel
-            .request_pty("xterm", None, None)
-            .await
-            .context("Failed to request PTY")?;
-
-        channel.shell().await.context("Failed to open shell")?;
-
-        let shell_channel = ShellChannel::new(channel);
-
-        let state = SessionState {
-            session,
-            channel: shell_channel,
-        };
-
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(host_alias.to_string(), state);
+        let mut state = Self::open_shell_session(session).await?;
+        Self::initialize_shell(&mut state).await?;
+        self.insert_session(host_alias, state).await;
 
         Ok(())
     }
 
-    #[allow(dead_code)]
+    pub async fn register_direct_profile(
+        &self,
+        host_alias: &str,
+        user: &str,
+        hostname: &str,
+        port: Option<u16>,
+        password: Option<String>,
+    ) {
+        self.direct_profiles.lock().await.insert(
+            host_alias.to_string(),
+            DirectProfile {
+                user: user.to_string(),
+                hostname: hostname.to_string(),
+                port,
+                password,
+            },
+        );
+    }
+
     pub async fn is_connected(&self, host_alias: &str) -> bool {
         let sessions = self.sessions.lock().await;
         sessions.contains_key(host_alias)
+    }
+
+    /// Reconnects via ~/.ssh/config or a registered direct profile (after MCP process restart).
+    pub async fn ensure_connected(&self, host_alias: &str) -> Result<()> {
+        if self.is_connected(host_alias).await {
+            return Ok(());
+        }
+        if parse_ssh_config(host_alias).is_ok() {
+            return self.connect_by_alias(host_alias).await;
+        }
+        let profile = self.direct_profiles.lock().await.get(host_alias).cloned();
+        if let Some(profile) = profile {
+            if self
+                .connect_direct(host_alias, &profile.user, &profile.hostname, profile.port)
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if let Some(ref password) = profile.password.filter(|p| !p.is_empty()) {
+                return self
+                    .connect_with_password(
+                        host_alias,
+                        &profile.user,
+                        &profile.hostname,
+                        password,
+                        profile.port,
+                    )
+                    .await;
+            }
+            anyhow::bail!(
+                "Direct profile reconnect failed for '{host_alias}' (keys failed, no password stored)"
+            );
+        }
+        self.connect_by_alias(host_alias).await
     }
 
     pub async fn execute_command(
@@ -320,13 +432,41 @@ impl SessionManager {
         host_alias: &str,
         command: &str,
         sudo_password: Option<&str>,
-    ) -> Result<crate::ssh::channel::CommandOutput> {
-        let mut sessions = self.sessions.lock().await;
-        let state = sessions
-            .get_mut(host_alias)
-            .ok_or_else(|| anyhow::anyhow!("Not connected to host '{}'", host_alias))?;
+        timeouts: CommandTimeouts,
+    ) -> Result<crate::ssh::channel::CommandOutput, SshCommandError> {
+        let managed = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(host_alias)
+                .cloned()
+                .ok_or_else(|| SshCommandError::NotConnected(host_alias.to_string()))?
+        };
 
-        state.channel.execute_command(command, sudo_password).await
+        let mut state = managed.inner.lock().await;
+        match state
+            .channel
+            .execute_command(command, sudo_password, timeouts)
+            .await
+        {
+            Ok(output) => {
+                if let Some(code) = output.exit_code
+                    && code != 0
+                {
+                    return Err(SshCommandError::CommandFailed {
+                        exit_code: code,
+                        stdout: output.stdout,
+                    });
+                }
+                Ok(output)
+            }
+            Err(e) => {
+                if e.should_evict_session() {
+                    drop(state);
+                    self.evict(host_alias).await;
+                }
+                Err(e)
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -334,21 +474,171 @@ impl SessionManager {
         &self,
         host_alias: &str,
         command: &str,
-    ) -> Result<String> {
-        let mut sessions = self.sessions.lock().await;
-        let state = sessions
-            .get_mut(host_alias)
-            .ok_or_else(|| anyhow::anyhow!("Not connected to host '{}'", host_alias))?;
+    ) -> Result<String, SshCommandError> {
+        let output = self
+            .execute_command(host_alias, command, None, CommandTimeouts::default())
+            .await?;
+        Ok(output.stdout)
+    }
 
-        state.channel.execute_command_streaming(command).await
+    fn control_timeouts() -> CommandTimeouts {
+        CommandTimeouts::from_secs(Some(jobs::CONTROL_IDLE_SECS), Some(jobs::CONTROL_MAX_SECS))
+    }
+
+    /// Runs a short control command and returns raw stdout, ignoring the
+    /// command's non-zero exit code (control scripts always echo a sentinel).
+    async fn run_control(
+        &self,
+        host_alias: &str,
+        command: &str,
+    ) -> Result<String, SshCommandError> {
+        match self
+            .execute_command(host_alias, command, None, Self::control_timeouts())
+            .await
+        {
+            Ok(output) => Ok(output.stdout),
+            Err(SshCommandError::CommandFailed { stdout, .. }) => Ok(stdout),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn host_has_tmux(&self, host_alias: &str) -> bool {
+        if let Some(cached) = self.tmux_cache.lock().await.get(host_alias) {
+            return *cached;
+        }
+        let available = match self
+            .run_control(host_alias, jobs::detect_tmux_command())
+            .await
+        {
+            Ok(out) => jobs::tmux_available(&out),
+            Err(_) => false,
+        };
+        self.tmux_cache
+            .lock()
+            .await
+            .insert(host_alias.to_string(), available);
+        available
+    }
+
+    pub async fn run_detached(
+        &self,
+        host_alias: &str,
+        command: &str,
+    ) -> Result<(String, bool), SshCommandError> {
+        let use_tmux = self.host_has_tmux(host_alias).await;
+        let job_id = jobs::new_job_id();
+        let detach_cmd = jobs::build_detach_command(command, &job_id, use_tmux);
+        self.run_control(host_alias, &detach_cmd).await?;
+
+        self.jobs.lock().await.insert(
+            job_id.clone(),
+            JobMeta {
+                host: host_alias.to_string(),
+                read_bytes: 0,
+                use_tmux,
+            },
+        );
+        Ok((job_id, use_tmux))
+    }
+
+    async fn resolve_job_host(&self, host_alias: &str, job_id: &str) -> String {
+        match self.jobs.lock().await.get(job_id) {
+            Some(meta) => meta.host.clone(),
+            None => host_alias.to_string(),
+        }
+    }
+
+    pub async fn job_status(
+        &self,
+        host_alias: &str,
+        job_id: &str,
+    ) -> Result<JobReport, SshCommandError> {
+        let host = self.resolve_job_host(host_alias, job_id).await;
+        let read_from = {
+            let jobs = self.jobs.lock().await;
+            jobs.get(job_id).map(|m| m.read_bytes).unwrap_or(0) + 1
+        };
+
+        let status_cmd = jobs::build_status_command(job_id, read_from);
+        let raw = self.run_control(&host, &status_cmd).await?;
+        let (state, size, output, use_tmux) = jobs::parse_status(&raw);
+
+        let mut jobs = self.jobs.lock().await;
+        let meta = jobs.entry(job_id.to_string()).or_insert_with(|| JobMeta {
+            host: host.clone(),
+            read_bytes: 0,
+            use_tmux,
+        });
+        meta.read_bytes = size;
+        meta.use_tmux = use_tmux;
+
+        Ok(JobReport {
+            job_id: job_id.to_string(),
+            state,
+            output,
+            timed_out: false,
+        })
+    }
+
+    async fn resolve_job_use_tmux(&self, host: &str, job_id: &str) -> bool {
+        if let Some(m) = self.jobs.lock().await.get(job_id) {
+            return m.use_tmux;
+        }
+        let cmd = format!(
+            "cat \"{}/backend\" 2>/dev/null || echo native",
+            jobs::job_dir(job_id)
+        );
+        match self.run_control(host, &cmd).await {
+            Ok(out) => jobs::backend_is_tmux(&out),
+            Err(_) => false,
+        }
+    }
+
+    pub async fn job_signal(
+        &self,
+        host_alias: &str,
+        job_id: &str,
+        signal: JobSignal,
+    ) -> Result<(), SshCommandError> {
+        let host = self.resolve_job_host(host_alias, job_id).await;
+        let use_tmux = self.resolve_job_use_tmux(&host, job_id).await;
+        let signal_cmd = jobs::build_signal_command(job_id, signal, use_tmux);
+        self.run_control(&host, &signal_cmd).await?;
+        Ok(())
+    }
+
+    pub async fn job_wait(
+        &self,
+        host_alias: &str,
+        job_id: &str,
+        timeout_secs: u64,
+    ) -> Result<JobReport, SshCommandError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let mut accumulated = String::new();
+
+        loop {
+            let report = self.job_status(host_alias, job_id).await?;
+            accumulated.push_str(&report.output);
+
+            if let JobState::Exited(_) = report.state {
+                return Ok(JobReport {
+                    output: accumulated,
+                    ..report
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(JobReport {
+                    output: accumulated,
+                    timed_out: true,
+                    ..report
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(JOB_POLL_INTERVAL_MS)).await;
+        }
     }
 
     pub async fn disconnect(&self, host_alias: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(state) = sessions.remove(host_alias) {
-            state.channel.close().await?;
-            state.session.disconnect(None, "Goodbye", None).await?;
-        }
+        self.evict(host_alias).await;
         Ok(())
     }
 
@@ -363,6 +653,9 @@ impl Clone for SessionManager {
     fn clone(&self) -> Self {
         Self {
             sessions: Arc::clone(&self.sessions),
+            jobs: Arc::clone(&self.jobs),
+            tmux_cache: Arc::clone(&self.tmux_cache),
+            direct_profiles: Arc::clone(&self.direct_profiles),
         }
     }
 }

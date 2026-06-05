@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::{self, BufRead, BufReader, Write};
 
-use crate::ssh::SessionManager;
+use crate::ssh::{CommandTimeouts, SessionManager};
 
 pub async fn run_cli_mode(
     host_alias: Option<String>,
@@ -201,7 +201,10 @@ pub async fn run_cli_mode(
         }
 
         if let Some(ref alias) = current_host {
-            match manager.execute_command(alias, command, None).await {
+            match manager
+                .execute_command(alias, command, None, CommandTimeouts::default())
+                .await
+            {
                 Ok(output) => {
                     if !output.stdout.trim().is_empty() {
                         print!("{}", output.stdout.trim_end());

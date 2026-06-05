@@ -10,7 +10,10 @@ use rmcp::{
 use crate::ssh::SessionManager;
 
 pub mod tools;
-use tools::{SshConnectDirectParams, SshConnectParams, SshReadLogParams, SshRunCommandParams};
+use tools::{
+    SshConnectDirectParams, SshConnectParams, SshJobSignalParams, SshJobStatusParams,
+    SshJobWaitParams, SshReadLogParams, SshRunCommandParams, SshRunDetachedParams,
+};
 
 pub struct SshMcpServer {
     session_manager: SessionManager,
@@ -59,13 +62,57 @@ impl SshMcpServer {
 
     #[tool(
         name = "ssh_run_command",
-        description = "Execute a command on a connected SSH host. Commands run in a persistent shell session, so state (like current directory) is preserved between commands. Use sudo_password for commands that require sudo. 30s timeout. IMPORTANT: Use --no-pager for systemctl, journalctl, git log, etc., otherwise output will hang. Avoid interactive/pager commands (less, vim, top, htop) — they will hang. For commands that produce no stdout (e.g. systemctl restart): if timeout occurs, append `&& echo` or `; echo` to force output. WARNING: Destructive operations (rm, mv, etc.) should be avoided. Prefer read-only commands."
+        description = "Execute a command on a connected SSH host. Auto-connects via ~/.ssh/config when no session exists in this server process (ssh_connect is optional). Commands run in a persistent shell session, so state (like current directory) is preserved between commands in the same process. Timeouts: idle default 30s (no output) and hard max default 30s; override with timeout_secs / max_timeout_secs (no cap, pass a larger max explicitly when you expect a long command). For commands that may run long, prefer ssh_run_detached so you never block. Hung commands (no output past idle) are interrupted so the next command can proceed. Connection loss requires reconnect. Use sudo_password for sudo. IMPORTANT: Use --no-pager for systemctl, journalctl, git log. Avoid interactive commands (less, vim, top, htop). WARNING: Prefer read-only commands."
     )]
     pub async fn ssh_run_command(
         &self,
         params: Parameters<SshRunCommandParams>,
     ) -> Result<CallToolResult, McpError> {
         tools::ssh_run_command_impl(&self.session_manager, params).await
+    }
+
+    #[tool(
+        name = "ssh_run_detached",
+        description = "Run a long-running command in the background on a connected host without blocking. Returns a job_id. Output is buffered on the remote host (uses tmux if available, otherwise native job control). Use this instead of ssh_run_command when a command may exceed the command timeout. Poll with ssh_job_status, block with ssh_job_wait, and interrupt/kill with ssh_job_signal."
+    )]
+    pub async fn ssh_run_detached(
+        &self,
+        params: Parameters<SshRunDetachedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ssh_run_detached_impl(&self.session_manager, params).await
+    }
+
+    #[tool(
+        name = "ssh_job_status",
+        description = "Get the current state (running / exited with code) and any new output of a detached job since the last status read. Non-blocking."
+    )]
+    pub async fn ssh_job_status(
+        &self,
+        params: Parameters<SshJobStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ssh_job_status_impl(&self.session_manager, params).await
+    }
+
+    #[tool(
+        name = "ssh_job_wait",
+        description = "Attach to a detached job and block until it finishes or timeout_secs elapses (default 30s). Returns accumulated output. If it times out the job keeps running; call again or use ssh_job_signal."
+    )]
+    pub async fn ssh_job_wait(
+        &self,
+        params: Parameters<SshJobWaitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ssh_job_wait_impl(&self.session_manager, params).await
+    }
+
+    #[tool(
+        name = "ssh_job_signal",
+        description = "Send a signal to a detached job: 'int' (SIGINT to worker pid, TERM fallback, tmux C-c when applicable), 'term' (SIGTERM to worker), 'kill' (SIGKILL to worker plus tmux session cleanup). Use when a job hangs or is no longer needed."
+    )]
+    pub async fn ssh_job_signal(
+        &self,
+        params: Parameters<SshJobSignalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::ssh_job_signal_impl(&self.session_manager, params).await
     }
 
     #[tool(
@@ -112,6 +159,10 @@ pub async fn run_mcp_server() -> Result<()> {
     eprintln!("  - ssh_connect        Connect to SSH host via ~/.ssh/config");
     eprintln!("  - ssh_connect_direct Connect to SSH host directly");
     eprintln!("  - ssh_run_command    Execute commands on connected host");
+    eprintln!("  - ssh_run_detached   Run a long command in the background");
+    eprintln!("  - ssh_job_status     Read status/output of a detached job");
+    eprintln!("  - ssh_job_wait       Attach/wait for a detached job");
+    eprintln!("  - ssh_job_signal     Send INT/TERM/KILL to a detached job");
     eprintln!("  - ssh_read_log       Read log files from remote host");
     eprintln!();
     eprintln!("Security: Prefer read-only operations");

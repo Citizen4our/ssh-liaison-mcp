@@ -113,7 +113,10 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                match manager.execute_command("direct", command, None).await {
+                match manager
+                    .execute_command("direct", command, None, ssh::CommandTimeouts::default())
+                    .await
+                {
                     Ok(output) => {
                         if !output.stdout.trim().is_empty() {
                             print!("{}", output.stdout.trim_end());
