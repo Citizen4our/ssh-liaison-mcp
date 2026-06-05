@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: ssh-liaison-mcp
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          cd ../../..
+          shasum -a 256 ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz > ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Create archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path ${{ env.BINARY_NAME }}.exe -DestinationPath ../../../${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+          cd ../../..
+          $hash = (Get-FileHash "${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip" | Out-File -Encoding ascii -NoNewline "${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ env.BINARY_NAME }}-*.${{ matrix.archive }}
+            ${{ env.BINARY_NAME }}-*.${{ matrix.archive }}.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Create checksums file
+        run: |
+          cd release
+          cat *.sha256 > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## SSH Liaison MCP Server ${{ steps.version.outputs.version }}
+
+            ### Installation
+
+            Download the appropriate binary for your platform from the assets below.
+
+            #### macOS
+            ```bash
+            # Intel Mac
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz
+
+            # Apple Silicon
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz
+            ```
+
+            #### Linux
+            ```bash
+            # x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+
+            # ARM64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            ```
+
+            ### Verify Checksums
+            ```bash
+            shasum -a 256 -c checksums.txt
+            ```
+          draft: false
+          prerelease: false
+          files: |
+            release/*

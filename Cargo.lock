@@ -882,6 +882,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-ssh2-lite",
+ "base64",
  "clap",
  "regex",
  "rmcp",

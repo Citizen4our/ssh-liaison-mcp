@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::ssh::error::SshCommandError;
 use async_ssh2_lite::AsyncChannel;
 use async_ssh2_lite::TokioTcpStream;
 use regex::Regex;
@@ -7,16 +7,38 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MAX_TIMEOUT_SECS: u64 = 30;
 const READ_BUFFER_SIZE: usize = 4096;
-const READ_TIMEOUT_MS: u64 = 100;
-const NO_DATA_THRESHOLD: u32 = 10;
-const IDLE_TIMEOUT_MS: u64 = 500;
+const READ_POLL_MS: u64 = 100;
 const CONTINUE_READ_ATTEMPTS: u32 = 10;
 const CONTINUE_READ_TIMEOUT_MS: u64 = 100;
 const CONTINUE_READ_MAX_FAILURES: u32 = 3;
 const SLEEP_ON_EOF_MS: u64 = 50;
-const SLEEP_ON_ERROR_MS: u64 = 10;
+const DRAIN_IDLE_MS: u64 = 2000;
+const DRAIN_MAX_ATTEMPTS: u32 = 40;
+const CTRL_C: &[u8] = b"\x03";
+
+#[derive(Debug, Clone, Copy)]
+pub struct CommandTimeouts {
+    pub idle: Duration,
+    pub max: Duration,
+}
+
+impl Default for CommandTimeouts {
+    fn default() -> Self {
+        Self::from_secs(None, None)
+    }
+}
+
+impl CommandTimeouts {
+    pub fn from_secs(idle_secs: Option<u64>, max_secs: Option<u64>) -> Self {
+        let idle = Duration::from_secs(idle_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
+        let max_raw = max_secs.unwrap_or(DEFAULT_MAX_TIMEOUT_SECS);
+        let max = Duration::from_secs(max_raw.max(idle.as_secs()));
+        Self { idle, max }
+    }
+}
 
 fn generate_marker() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,13 +46,14 @@ fn generate_marker() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("__SSH_CMD_DONE_{}__", timestamp)
+    format!("__SSH_CMD_DONE_{timestamp}__")
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
+    pub exit_code: Option<i32>,
 }
 
 impl CommandOutput {
@@ -54,8 +77,8 @@ pub struct ShellChannel {
     channel: AsyncChannel<TokioTcpStream>,
 }
 
-/// Marker on own line (preceded by \n or at start) — ignores echoed command, truncates at real marker.
-fn find_last_marker_on_own_line(output: &str, marker: &str) -> Option<usize> {
+/// Matches only a completed marker line (`MARKER:0`), not PTY echo (`MARKER:$?`).
+fn find_last_completed_marker(output: &str, marker: &str) -> Option<usize> {
     let mut last_pos = None;
     let mut search_pos = 0;
     while let Some(pos) = output[search_pos..].find(marker) {
@@ -63,17 +86,49 @@ fn find_last_marker_on_own_line(output: &str, marker: &str) -> Option<usize> {
         let at_line_start =
             abs_pos == 0 || output.as_bytes().get(abs_pos.wrapping_sub(1)) == Some(&b'\n');
         if at_line_start {
-            last_pos = Some(abs_pos);
+            let after = abs_pos + marker.len();
+            if output.as_bytes().get(after) == Some(&b':') {
+                let code = &output[after + 1..];
+                let digits = code.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 {
+                    let next = code.chars().nth(digits);
+                    if next.is_none_or(|c| c == '\n' || c == '\r') {
+                        last_pos = Some(abs_pos);
+                    }
+                }
+            }
         }
         search_pos = abs_pos + marker.len();
     }
     last_pos
 }
 
+fn parse_exit_code_after_marker(output: &str, marker: &str, marker_pos: usize) -> Option<i32> {
+    let tail = &output[marker_pos + marker.len()..];
+    let line_end = tail.find('\n').unwrap_or(tail.len());
+    let after = &tail[..line_end];
+    let code_str = after.strip_prefix(':')?;
+    code_str.trim().parse().ok()
+}
+
+fn wrap_command_for_marker(command: &str, marker: &str) -> String {
+    format!("set +e; {command}; echo {marker}:$?")
+}
+
 fn remove_command_echo(output: &mut String, command: &str, marker: &str) {
-    let full_cmd = format!("{}; echo {}", command, marker);
-    while let Some(cmd_pos) = output.find(&full_cmd) {
-        output.replace_range(cmd_pos..cmd_pos + full_cmd.len(), "");
+    for suffix in ["", ":0", ":1", ":7"] {
+        for wrapper in [
+            wrap_command_for_marker(command, marker),
+            format!("{command}; echo {marker}{suffix}"),
+        ] {
+            while let Some(cmd_pos) = output.find(&wrapper) {
+                output.replace_range(cmd_pos..cmd_pos + wrapper.len(), "");
+            }
+        }
+    }
+    let legacy = format!("{command}; echo {marker}:$?");
+    while let Some(cmd_pos) = output.find(&legacy) {
+        output.replace_range(cmd_pos..cmd_pos + legacy.len(), "");
     }
 }
 
@@ -82,56 +137,143 @@ impl ShellChannel {
         Self { channel }
     }
 
+    pub(crate) async fn send_raw(&mut self, data: &str) -> Result<(), SshCommandError> {
+        self.write_bytes(data.as_bytes()).await
+    }
+
+    pub async fn drain_pending(&mut self, max_ms: u64) {
+        let started = Instant::now();
+        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+        while started.elapsed() < Duration::from_millis(max_ms) {
+            match tokio::time::timeout(
+                Duration::from_millis(READ_POLL_MS),
+                self.channel.read(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok(0)) => sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+
+    async fn write_bytes(&mut self, data: &[u8]) -> Result<(), SshCommandError> {
+        self.channel
+            .write_all(data)
+            .await
+            .map_err(|e| SshCommandError::Io(e.to_string()))?;
+        self.channel
+            .flush()
+            .await
+            .map_err(|e| SshCommandError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn interrupt_and_drain(&mut self) -> bool {
+        let _ = self.channel.write_all(CTRL_C).await;
+        let _ = self.channel.flush().await;
+        sleep(Duration::from_millis(100)).await;
+
+        let probe = generate_marker();
+        let probe_cmd = format!("echo {probe}:$?\n");
+        if self.channel.write_all(probe_cmd.as_bytes()).await.is_err() {
+            return false;
+        }
+        let _ = self.channel.flush().await;
+
+        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+        let mut accumulated = String::new();
+        let started = Instant::now();
+        let mut attempts = 0u32;
+
+        while started.elapsed() < Duration::from_millis(DRAIN_IDLE_MS)
+            && attempts < DRAIN_MAX_ATTEMPTS
+        {
+            attempts += 1;
+            match tokio::time::timeout(
+                Duration::from_millis(READ_POLL_MS),
+                self.channel.read(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {
+                    if self.channel.eof() {
+                        return false;
+                    }
+                    sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await;
+                }
+                Ok(Ok(n)) => {
+                    accumulated.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                    if find_last_completed_marker(&accumulated, &probe).is_some() {
+                        return true;
+                    }
+                }
+                Ok(Err(_)) => return false,
+                Err(_) => sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await,
+            }
+        }
+
+        false
+    }
+
+    async fn finish_after_timeout(
+        &mut self,
+        limit: Duration,
+        idle: bool,
+    ) -> Result<CommandOutput, SshCommandError> {
+        let recovered = self.interrupt_and_drain().await;
+        Err(SshCommandError::CommandTimeout {
+            limit,
+            idle,
+            session_recovered: recovered,
+        })
+    }
+
     pub async fn execute_command(
         &mut self,
         command: &str,
         sudo_password: Option<&str>,
-    ) -> Result<CommandOutput> {
+        timeouts: CommandTimeouts,
+    ) -> Result<CommandOutput, SshCommandError> {
         let marker = generate_marker();
-        let full_command = format!("{}; echo {}\n", command, marker);
+        let full_command = format!("{};\n", wrap_command_for_marker(command, &marker));
 
-        tracing::debug!(command = %command, "Executing command");
+        tracing::debug!(command = %command, ?timeouts, "Executing command");
         tracing::trace!(full_command = %full_command.trim(), "Full command with marker");
 
-        self.channel.write_all(full_command.as_bytes()).await?;
-        self.channel.flush().await?;
-
-        tracing::trace!("Command sent, starting to read");
+        self.write_bytes(full_command.as_bytes()).await?;
 
         let mut stdout = String::new();
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-        let start = Instant::now();
-        let mut marker_found = false;
-        let mut last_read_time = Instant::now();
-        let mut no_data_count = 0;
+        let started = Instant::now();
+        let mut last_activity = Instant::now();
         let mut sudo_password_sent = false;
 
         loop {
-            if start.elapsed() > COMMAND_TIMEOUT {
-                tracing::warn!(elapsed = ?start.elapsed(), "Command timeout");
-                anyhow::bail!("Command timeout after {:?}", COMMAND_TIMEOUT);
+            if started.elapsed() >= timeouts.max {
+                return self.finish_after_timeout(timeouts.max, false).await;
+            }
+            if last_activity.elapsed() >= timeouts.idle {
+                return self.finish_after_timeout(timeouts.idle, true).await;
             }
 
             let read_future = self.channel.read(&mut buffer);
-            let timeout_future = sleep(Duration::from_millis(READ_TIMEOUT_MS));
+            let poll = sleep(Duration::from_millis(READ_POLL_MS));
 
             tokio::select! {
                 result = read_future => {
                     match result {
                         Ok(0) => {
-                            if marker_found {
-                                break;
-                            }
-                            no_data_count += 1;
-                            if no_data_count > NO_DATA_THRESHOLD && last_read_time.elapsed() > Duration::from_millis(IDLE_TIMEOUT_MS) {
-                                tracing::trace!(idle_ms = IDLE_TIMEOUT_MS, "No data, assuming command completed");
-                                break;
+                            if self.channel.eof() {
+                                return Err(SshCommandError::ConnectionLost(
+                                    "SSH channel closed".into(),
+                                ));
                             }
                             sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await;
                         }
                         Ok(n) => {
-                            last_read_time = Instant::now();
-                            no_data_count = 0;
+                            last_activity = Instant::now();
                             let chunk = String::from_utf8_lossy(&buffer[..n]);
                             tracing::trace!(bytes = n, "Read data");
                             stdout.push_str(&chunk);
@@ -141,27 +283,25 @@ impl ShellChannel {
                             if sudo_prompt && !sudo_password_sent {
                                 if let Some(pass) = sudo_password {
                                     tracing::trace!("Sudo password prompt detected, sending response");
-                                    self.channel
-                                        .write_all(format!("{}\n", pass).as_bytes())
-                                        .await?;
-                                    self.channel.flush().await?;
+                                    self.write_bytes(format!("{pass}\n").as_bytes()).await?;
                                     sudo_password_sent = true;
+                                    last_activity = Instant::now();
                                 } else {
-                                    anyhow::bail!(
-                                        "Command requires sudo password. Elicitation support coming soon. \
-                                        Please ensure the user has passwordless sudo configured or handle manually."
-                                    );
+                                    return Err(SshCommandError::SudoPasswordRequired);
                                 }
                             }
 
-                            if let Some(marker_pos) = find_last_marker_on_own_line(&stdout, &marker) {
-                                tracing::trace!(position = marker_pos, "Marker found");
-
+                            if find_last_completed_marker(&stdout, &marker).is_some() {
                                 let mut continue_reading = true;
                                 let mut read_attempts = 0;
 
                                 while continue_reading && read_attempts < CONTINUE_READ_ATTEMPTS {
-                                    match tokio::time::timeout(Duration::from_millis(CONTINUE_READ_TIMEOUT_MS), self.channel.read(&mut buffer)).await {
+                                    match tokio::time::timeout(
+                                        Duration::from_millis(CONTINUE_READ_TIMEOUT_MS),
+                                        self.channel.read(&mut buffer),
+                                    )
+                                    .await
+                                    {
                                         Ok(Ok(0)) => {
                                             read_attempts += 1;
                                             sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await;
@@ -170,8 +310,7 @@ impl ShellChannel {
                                             let chunk = String::from_utf8_lossy(&buffer[..n]);
                                             stdout.push_str(&chunk);
                                             read_attempts = 0;
-
-                                            if chunk.contains(&marker) {
+                                            if find_last_completed_marker(&stdout, &marker).is_some() {
                                                 continue_reading = false;
                                             }
                                         }
@@ -184,45 +323,36 @@ impl ShellChannel {
                                     }
                                 }
 
-                                if let Some(pos) = find_last_marker_on_own_line(&stdout, &marker) {
-                                    tracing::trace!(position = pos, total_len = stdout.len(), "Using marker on own line");
+                                if let Some(pos) = find_last_completed_marker(&stdout, &marker) {
+                                    let exit_code = parse_exit_code_after_marker(&stdout, &marker, pos);
                                     stdout.truncate(pos);
                                     remove_command_echo(&mut stdout, command, &marker);
-                                    marker_found = true;
-                                    break;
+                                    let cleaned = clean_ansi_sequences(&stdout);
+                                    return Ok(CommandOutput {
+                                        stdout: cleaned.trim_end().to_string(),
+                                        stderr: String::new(),
+                                        exit_code,
+                                    });
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::trace!(error = %e, "Read error");
-                            sleep(Duration::from_millis(SLEEP_ON_ERROR_MS)).await;
+                            tracing::warn!(error = %e, "SSH channel read failed");
+                            return Err(SshCommandError::ConnectionLost(e.to_string()));
                         }
                     }
                 }
-                _ = timeout_future => {
-                    if marker_found {
-                        break;
-                    }
-                    if last_read_time.elapsed() > Duration::from_millis(IDLE_TIMEOUT_MS) && no_data_count > 5 {
-                        tracing::trace!(idle_ms = IDLE_TIMEOUT_MS, "No data, breaking");
-                        break;
-                    }
-                }
+                _ = poll => {}
             }
         }
+    }
 
-        tracing::trace!(
-            stdout_len = stdout.len(),
-            marker_found = marker_found,
-            "Loop finished"
-        );
-
-        let cleaned = clean_ansi_sequences(&stdout);
-
-        Ok(CommandOutput {
-            stdout: cleaned.trim_end().to_string(),
-            stderr: String::new(),
-        })
+    pub async fn shutdown(&mut self) -> Result<(), SshCommandError> {
+        self.channel
+            .close()
+            .await
+            .map_err(|e| SshCommandError::Io(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -249,60 +379,66 @@ fn clean_ansi_sequences(text: &str) -> String {
 
 impl ShellChannel {
     #[allow(dead_code)]
-    pub async fn execute_command_streaming(&mut self, command: &str) -> Result<String> {
-        let marker = generate_marker();
-        let full_command = format!("{}; echo {}\n", command, marker);
-
-        self.channel.write_all(full_command.as_bytes()).await?;
-        self.channel.flush().await?;
-
-        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-        let mut stdout_accumulated = String::new();
-        let start = Instant::now();
-
-        loop {
-            if start.elapsed() > COMMAND_TIMEOUT {
-                anyhow::bail!("Command timeout after {:?}", COMMAND_TIMEOUT);
-            }
-
-            match self.channel.read(&mut buffer).await {
-                Ok(0) => {
-                    sleep(Duration::from_millis(SLEEP_ON_EOF_MS)).await;
-                    continue;
-                }
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buffer[..n]);
-                    stdout_accumulated.push_str(&chunk);
-
-                    if let Some(pos) = stdout_accumulated.find(&marker) {
-                        stdout_accumulated.truncate(pos);
-                        break;
-                    }
-
-                    print!("{}", chunk);
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
-                }
-                Err(_) => {
-                    sleep(Duration::from_millis(SLEEP_ON_ERROR_MS)).await;
-                }
-            }
-        }
-
-        println!();
-
-        Ok(stdout_accumulated)
+    pub async fn execute_command_streaming(
+        &mut self,
+        command: &str,
+    ) -> Result<String, SshCommandError> {
+        let output = self
+            .execute_command(command, None, CommandTimeouts::default())
+            .await?;
+        Ok(output.stdout)
     }
 
     #[allow(dead_code)]
-    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.channel.write_all(data).await?;
-        self.channel.flush().await?;
-        Ok(())
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), SshCommandError> {
+        self.write_bytes(data).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_timeouts_default_and_cap() {
+        let t = CommandTimeouts::from_secs(None, None);
+        assert_eq!(t.idle, Duration::from_secs(30));
+        assert_eq!(t.max, Duration::from_secs(30));
+
+        let explicit = CommandTimeouts::from_secs(Some(10), Some(600));
+        assert_eq!(explicit.max, Duration::from_secs(600));
+        assert!(explicit.max >= explicit.idle);
+
+        let floor = CommandTimeouts::from_secs(Some(45), Some(10));
+        assert_eq!(floor.max, Duration::from_secs(45));
     }
 
-    pub async fn close(mut self) -> Result<()> {
-        self.channel.close().await?;
-        Ok(())
+    #[test]
+    fn completed_marker_ignores_pty_echo_with_dollar_question() {
+        let marker = "__SSH_CMD_DONE_1__";
+        let out = format!("{marker}:$?\noutput\n{marker}:0\n");
+        let pos = find_last_completed_marker(&out, marker).unwrap();
+        assert_eq!(pos, out.rfind(marker).unwrap());
+    }
+
+    #[test]
+    fn test_parse_exit_code_after_marker() {
+        let marker = "__SSH_CMD_DONE_99__";
+        let out = format!("ok\n{marker}:42\n");
+        let pos = find_last_completed_marker(&out, marker).unwrap();
+        assert_eq!(parse_exit_code_after_marker(&out, marker, pos), Some(42));
+    }
+
+    #[test]
+    fn remove_command_echo_strips_sent_line() {
+        let marker = "__SSH_CMD_DONE_1__";
+        let mut out = format!(
+            "{marker}:0\n{wrapped}\noutput\n",
+            marker = marker,
+            wrapped = wrap_command_for_marker("pwd", marker)
+        );
+        remove_command_echo(&mut out, "pwd", marker);
+        assert!(!out.contains("echo"));
+        assert!(out.contains("output"));
     }
 }
