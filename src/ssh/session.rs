@@ -165,6 +165,7 @@ impl SessionManager {
         let mut authenticated = false;
 
         if !config.identities_only {
+            super::agent_sock::ensure_ssh_auth_sock();
             tracing::debug!("Attempting SSH agent authentication");
             match session.userauth_agent(user).await {
                 Ok(_) => {
@@ -287,12 +288,16 @@ impl SessionManager {
 
             error_msg.push_str(" Check that:");
             if !config.identities_only {
-                error_msg.push_str(" SSH agent is running,");
+                error_msg.push_str(
+                    " SSH agent is running with unlocked keys (ssh-add -l), SSH_AUTH_SOCK is reachable,",
+                );
             }
             if config.identity_file.is_some() {
                 error_msg.push_str(" the identity file exists and has correct permissions (600),");
             } else if !config.identities_only {
-                error_msg.push_str(" keys exist in ~/.ssh/,");
+                error_msg.push_str(
+                    " non-passphrase keys exist in ~/.ssh/ (passphrase keys need the agent),",
+                );
             }
             error_msg
                 .push_str(" and the public key is added to authorized_keys on the remote host.");
