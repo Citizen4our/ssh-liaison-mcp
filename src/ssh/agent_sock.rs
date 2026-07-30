@@ -5,6 +5,7 @@
 //! the launchd agent.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Ensures `SSH_AUTH_SOCK` points at a usable agent socket.
