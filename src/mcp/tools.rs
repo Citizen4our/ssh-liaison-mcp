@@ -241,7 +241,7 @@ pub async fn ssh_connect_direct_impl(
     let detail = key_result
         .err()
         .map(|e| e.to_string())
-        .unwrap_or_else(|| "unknown key auth failure".to_string());
+        .unwrap_or_else(|| "unknown key auth failure".into());
     Err(McpError::invalid_params(
         format!("SSH key authentication failed and no password provided. Detail: {detail}"),
         None,
