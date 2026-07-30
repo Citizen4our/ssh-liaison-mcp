@@ -244,3 +244,120 @@ async fn e2e_stateful_shell_preserved() {
 
     mgr.disconnect(&host).await.ok();
 }
+
+#[tokio::test]
+#[ignore = "live SSH host"]
+async fn e2e_idle_timeout_recovers_session() {
+    if !e2e_enabled() {
+        return;
+    }
+    let host = e2e_host();
+    let mgr = SessionManager::new();
+    mgr.connect_by_alias(&host).await.expect("connect");
+
+    let err = mgr
+        .execute_command(
+            &host,
+            "sleep 60",
+            None,
+            CommandTimeouts::from_secs(Some(3), Some(5)),
+        )
+        .await
+        .expect_err("sleep should idle-timeout");
+    match err {
+        SshCommandError::CommandTimeout {
+            session_recovered, ..
+        } => assert!(
+            session_recovered,
+            "session should be usable after idle timeout"
+        ),
+        other => panic!("expected CommandTimeout, got {other}"),
+    }
+
+    let out = mgr
+        .execute_command(
+            &host,
+            "echo after-idle-timeout",
+            None,
+            CommandTimeouts::default(),
+        )
+        .await
+        .expect("command after idle timeout");
+    assert!(
+        out.stdout.contains("after-idle-timeout"),
+        "stdout: {}",
+        out.stdout
+    );
+
+    mgr.disconnect(&host).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "live SSH host"]
+async fn e2e_sigint_ignore_restores_session() {
+    if !e2e_enabled() {
+        return;
+    }
+    let host = e2e_host();
+    let mgr = SessionManager::new();
+    mgr.connect_by_alias(&host).await.expect("connect");
+
+    let err = mgr
+        .execute_command(
+            &host,
+            "trap '' INT QUIT; sleep 60",
+            None,
+            CommandTimeouts::from_secs(Some(3), Some(5)),
+        )
+        .await
+        .expect_err("trapped sleep should timeout");
+    match err {
+        SshCommandError::CommandTimeout {
+            session_recovered, ..
+        } => assert!(
+            session_recovered,
+            "session should be restored after SIGINT/QUIT ignore"
+        ),
+        other => panic!("expected CommandTimeout, got {other}"),
+    }
+
+    assert!(
+        mgr.is_connected(&host).await,
+        "manager should keep/restore a live session"
+    );
+
+    let out = mgr
+        .execute_command(
+            &host,
+            "echo after-sigint-ignore",
+            None,
+            CommandTimeouts::default(),
+        )
+        .await
+        .expect("command after sigint-ignore timeout");
+    assert!(
+        out.stdout.contains("after-sigint-ignore"),
+        "stdout: {}",
+        out.stdout
+    );
+
+    mgr.disconnect(&host).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "live SSH host"]
+async fn e2e_unknown_host_is_not_catch_all_star() {
+    if !e2e_enabled() {
+        return;
+    }
+    let mgr = SessionManager::new();
+    let err = mgr
+        .connect_by_alias("tld")
+        .await
+        .expect_err("unknown host must not match Host *");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not found"),
+        "expected host-not-found, got: {msg}"
+    );
+}

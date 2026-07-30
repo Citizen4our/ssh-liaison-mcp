@@ -17,11 +17,18 @@ const CONTINUE_READ_MAX_FAILURES: u32 = 3;
 const SLEEP_ON_EOF_MS: u64 = 50;
 const DRAIN_IDLE_MS: u64 = 2000;
 const DRAIN_MAX_ATTEMPTS: u32 = 40;
+const WRITE_TIMEOUT_MS: u64 = 10_000;
+const INTERRUPT_SETTLE_MS: u64 = 150;
 const CTRL_C: &[u8] = b"\x03";
+const CTRL_BACKSLASH: &[u8] = b"\x1c";
 
-#[derive(Debug, Clone, Copy)]
+/// Idle and hard-duration limits for a synchronous SSH command.
+#[derive(Clone, Copy, Debug)]
 pub struct CommandTimeouts {
+    /// Maximum silence between output chunks before the command is interrupted.
     pub idle: Duration,
+
+    /// Absolute maximum runtime regardless of output activity.
     pub max: Duration,
 }
 
@@ -32,6 +39,7 @@ impl Default for CommandTimeouts {
 }
 
 impl CommandTimeouts {
+    /// Builds timeouts from optional second counts, applying defaults and flooring max to idle.
     pub fn from_secs(idle_secs: Option<u64>, max_secs: Option<u64>) -> Self {
         let idle = Duration::from_secs(idle_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
         let max_raw = max_secs.unwrap_or(DEFAULT_MAX_TIMEOUT_SECS);
@@ -49,14 +57,21 @@ fn generate_marker() -> String {
     format!("__SSH_CMD_DONE_{timestamp}__")
 }
 
-#[derive(Debug, Clone, Default)]
+/// Captured result of a remote shell command.
+#[derive(Clone, Debug, Default)]
 pub struct CommandOutput {
+    /// Command stdout (ANSI sequences stripped).
     pub stdout: String,
+
+    /// Command stderr when available.
     pub stderr: String,
+
+    /// Remote exit code when a completion marker was observed.
     pub exit_code: Option<i32>,
 }
 
 impl CommandOutput {
+    /// Formats stdout and labeled stderr into a single MCP-facing string.
     pub fn combined_with_stderr_label(&self) -> String {
         let mut result = String::new();
         if !self.stdout.trim().is_empty() {
@@ -73,11 +88,12 @@ impl CommandOutput {
     }
 }
 
+/// Persistent interactive shell channel used for marker-wrapped commands.
 pub struct ShellChannel {
     channel: AsyncChannel<TokioTcpStream>,
 }
 
-/// Matches only a completed marker line (`MARKER:0`), not PTY echo (`MARKER:$?`).
+/// Finds the last completed marker line (`MARKER:0`), ignoring PTY echo (`MARKER:$?`).
 fn find_last_completed_marker(output: &str, marker: &str) -> Option<usize> {
     let mut last_pos = None;
     let mut search_pos = 0;
@@ -159,28 +175,40 @@ impl ShellChannel {
     }
 
     async fn write_bytes(&mut self, data: &[u8]) -> Result<(), SshCommandError> {
-        self.channel
-            .write_all(data)
-            .await
-            .map_err(|e| SshCommandError::Io(e.to_string()))?;
-        self.channel
-            .flush()
-            .await
-            .map_err(|e| SshCommandError::Io(e.to_string()))?;
-        Ok(())
+        let write = async {
+            self.channel
+                .write_all(data)
+                .await
+                .map_err(|e| SshCommandError::Io(e.to_string()))?;
+            self.channel
+                .flush()
+                .await
+                .map_err(|e| SshCommandError::Io(e.to_string()))?;
+            Ok(())
+        };
+        match tokio::time::timeout(Duration::from_millis(WRITE_TIMEOUT_MS), write).await {
+            Ok(result) => result,
+            Err(_) => Err(SshCommandError::Io(format!(
+                "SSH channel write timed out after {WRITE_TIMEOUT_MS}ms"
+            ))),
+        }
     }
 
-    async fn interrupt_and_drain(&mut self) -> bool {
-        let _ = self.channel.write_all(CTRL_C).await;
-        let _ = self.channel.flush().await;
-        sleep(Duration::from_millis(100)).await;
+    async fn send_signal_raw(&mut self, signal: &[u8]) {
+        _ = tokio::time::timeout(Duration::from_millis(WRITE_TIMEOUT_MS), async {
+            _ = self.channel.write_all(signal).await;
+            _ = self.channel.flush().await;
+        })
+        .await;
+        sleep(Duration::from_millis(INTERRUPT_SETTLE_MS)).await;
+    }
 
+    async fn probe_shell_alive(&mut self) -> bool {
         let probe = generate_marker();
         let probe_cmd = format!("echo {probe}:$?\n");
-        if self.channel.write_all(probe_cmd.as_bytes()).await.is_err() {
+        if self.write_bytes(probe_cmd.as_bytes()).await.is_err() {
             return false;
         }
-        let _ = self.channel.flush().await;
 
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
         let mut accumulated = String::new();
@@ -215,6 +243,16 @@ impl ShellChannel {
         }
 
         false
+    }
+
+    async fn interrupt_and_drain(&mut self) -> bool {
+        self.send_signal_raw(CTRL_C).await;
+        if self.probe_shell_alive().await {
+            return true;
+        }
+
+        self.send_signal_raw(CTRL_BACKSLASH).await;
+        self.probe_shell_alive().await
     }
 
     async fn finish_after_timeout(
@@ -396,20 +434,23 @@ impl ShellChannel {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     #[test]
     fn command_timeouts_default_and_cap() {
         let t = CommandTimeouts::from_secs(None, None);
+
         assert_eq!(t.idle, Duration::from_secs(30));
         assert_eq!(t.max, Duration::from_secs(30));
 
         let explicit = CommandTimeouts::from_secs(Some(10), Some(600));
+
         assert_eq!(explicit.max, Duration::from_secs(600));
         assert!(explicit.max >= explicit.idle);
 
         let floor = CommandTimeouts::from_secs(Some(45), Some(10));
+
         assert_eq!(floor.max, Duration::from_secs(45));
     }
 
