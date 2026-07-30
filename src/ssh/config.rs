@@ -1,19 +1,27 @@
-use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+use anyhow::{Context, Result};
+
+/// Parsed SSH host block from `~/.ssh/config` (and includes).
+#[derive(Clone, Debug)]
 pub struct SshHostConfig {
     #[allow(dead_code)]
     pub host: String,
+
     pub hostname: Option<String>,
+
     pub user: Option<String>,
+
     pub port: Option<u16>,
+
     pub identity_file: Option<PathBuf>,
+
     pub proxy_command: Option<String>,
+
     pub proxy_use_fdpass: bool,
+
     pub identities_only: bool,
 }
 
@@ -93,6 +101,12 @@ fn read_config_file(path: &PathBuf, home: &str, visited: &mut HashSet<PathBuf>) 
     Ok(final_content)
 }
 
+/// Loads host settings for `host_alias` from `~/.ssh/config`.
+///
+/// # Errors
+///
+/// Returns an error when the config file is missing/unreadable, the host is not
+/// found, or catch-all `Host *` would be the only match.
 pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     let config_path = PathBuf::from(&home).join(".ssh").join("config");
@@ -106,7 +120,10 @@ pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
         .with_context(|| format!("Failed to read SSH config from {}", config_path.display()))?;
 
     tracing::trace!(config_length = content.len(), "Parsed SSH config");
+    resolve_host_from_content(host_alias, &content, &home)
+}
 
+fn resolve_host_from_content(host_alias: &str, content: &str, home: &str) -> Result<SshHostConfig> {
     let mut current_host: Option<String> = None;
     let mut hosts: HashMap<String, SshHostConfig> = HashMap::new();
 
@@ -162,7 +179,7 @@ pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
                 }
             } else if line_lower.starts_with("identityfile ") {
                 let path_str = line[13..].trim();
-                let expanded_path = expand_path(path_str, &home);
+                let expanded_path = expand_path(path_str, home);
                 config.identity_file = Some(expanded_path);
             } else if line_lower.starts_with("proxycommand ") {
                 let cmd = line[13..].trim();
@@ -194,25 +211,49 @@ pub fn parse_ssh_config(host_alias: &str) -> Result<SshHostConfig> {
             port = ?config.port,
             "Found exact match"
         );
-        return Ok(config.clone());
+        return Ok(with_default_hostname(config.clone(), host_alias));
     }
 
     for (host_pattern, config) in &hosts {
-        if host_pattern.contains('*') {
-            let pattern = host_pattern.replace("*", ".*");
-            if let Ok(re) = regex::Regex::new(&format!("^{}$", pattern))
+        if !is_usable_host_pattern(host_pattern) {
+            continue;
+        }
+        for pattern_token in host_pattern.split_whitespace() {
+            if !is_usable_host_pattern(pattern_token) {
+                continue;
+            }
+            if !pattern_token.contains('*') {
+                continue;
+            }
+            let pattern = pattern_token.replace('*', ".*");
+            if let Ok(re) = regex::Regex::new(&format!("^{pattern}$"))
                 && re.is_match(host_alias)
             {
-                return Ok(config.clone());
+                return Ok(with_default_hostname(config.clone(), host_alias));
             }
         }
     }
 
-    anyhow::bail!("Host '{}' not found in SSH config", host_alias)
+    anyhow::bail!("Host '{host_alias}' not found in SSH config")
+}
+
+/// Indicates whether `pattern` can be used as a connect-target host pattern.
+///
+/// Catch-all `Host *` only sets defaults; it is not a connect target.
+fn is_usable_host_pattern(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    !pattern.is_empty() && pattern != "*"
+}
+
+fn with_default_hostname(mut config: SshHostConfig, host_alias: &str) -> SshHostConfig {
+    if config.hostname.is_none() {
+        config.hostname = Some(host_alias.into());
+    }
+    config
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     #[test]
@@ -296,5 +337,53 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn catch_all_host_star_is_not_a_connect_target() {
+        let content = "\
+Host *
+  IdentityFile ~/.ssh/id_ed25519
+Host orb
+  HostName 127.0.0.1
+  User default
+  Port 32222
+";
+        let err = resolve_host_from_content("tld", content, "/home/user")
+            .expect_err("Host * must not match unknown aliases");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error: {err}"
+        );
+
+        let orb = resolve_host_from_content("orb", content, "/home/user").expect("orb");
+
+        assert_eq!(orb.hostname.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn wildcard_pattern_still_matches_and_defaults_hostname() {
+        let content = "\
+Host *.lab.example
+  User lab
+";
+        let cfg = resolve_host_from_content("box.lab.example", content, "/home/user")
+            .expect("wildcard host");
+
+        assert_eq!(cfg.hostname.as_deref(), Some("box.lab.example"));
+        assert_eq!(cfg.user.as_deref(), Some("lab"));
+    }
+
+    #[test]
+    fn exact_host_without_hostname_defaults_to_alias() {
+        let content = "\
+Host jump
+  User admin
+";
+        let cfg = resolve_host_from_content("jump", content, "/home/user").expect("jump");
+
+        assert_eq!(cfg.hostname.as_deref(), Some("jump"));
+        assert_eq!(cfg.user.as_deref(), Some("admin"));
     }
 }

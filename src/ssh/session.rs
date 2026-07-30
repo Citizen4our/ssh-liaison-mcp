@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
-use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use tokio::sync::Mutex;
 
 use super::channel::{CommandTimeouts, ShellChannel};
@@ -11,7 +13,22 @@ use super::error::SshCommandError;
 use super::jobs::{self, JobSignal, JobState};
 
 const KEEPALIVE_INTERVAL_SECS: u32 = 30;
+const CONNECT_TIMEOUT_SECS: u64 = 15;
 const JOB_POLL_INTERVAL_MS: u64 = 1000;
+
+async fn await_connect_step<T, E>(
+    label: &str,
+    fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(anyhow::anyhow!("{label}: {error}")),
+        Err(_) => anyhow::bail!("{label} timed out after {CONNECT_TIMEOUT_SECS}s"),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct DirectProfile {
@@ -91,22 +108,25 @@ impl SessionManager {
     }
 
     async fn open_shell_session(session: AsyncSession<TokioTcpStream>) -> Result<SessionState> {
-        let mut channel = session
-            .channel_session()
-            .await
-            .context("Failed to open channel")?;
+        let mut channel = await_connect_step("Open SSH channel", session.channel_session()).await?;
 
-        channel
-            .request_pty("dumb", None, None)
-            .await
-            .context("Failed to request PTY")?;
-
-        channel.shell().await.context("Failed to open shell")?;
+        await_connect_step("Request PTY", channel.request_pty("dumb", None, None)).await?;
+        await_connect_step("Open remote shell", channel.shell()).await?;
 
         Ok(SessionState {
             session,
             channel: ShellChannel::new(channel),
         })
+    }
+
+    async fn reopen_shell(state: &mut SessionState) -> Result<()> {
+        _ = state.channel.shutdown().await;
+        let mut channel =
+            await_connect_step("Reopen SSH channel", state.session.channel_session()).await?;
+        await_connect_step("Request PTY", channel.request_pty("dumb", None, None)).await?;
+        await_connect_step("Open remote shell", channel.shell()).await?;
+        state.channel = ShellChannel::new(channel);
+        Self::initialize_shell(state).await
     }
 
     async fn insert_session(&self, host_alias: &str, state: SessionState) {
@@ -125,8 +145,8 @@ impl SessionManager {
         };
         if let Some(managed) = removed {
             let mut state = managed.inner.lock().await;
-            let _ = state.channel.shutdown().await;
-            let _ = state.session.disconnect(None, "Goodbye", None).await;
+            _ = state.channel.shutdown().await;
+            _ = state.session.disconnect(None, "Goodbye", None).await;
         }
     }
 
@@ -150,23 +170,32 @@ impl SessionManager {
             tracing::debug!(hostname = %hostname, port = %port, "Attempting direct connection");
         }
 
-        let addr = tokio::net::lookup_host(format!("{}:{}", hostname, port))
-            .await
-            .context("Failed to resolve hostname")?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No address found for {}", hostname))?;
+        let addr = await_connect_step(
+            "Resolve hostname",
+            tokio::net::lookup_host(format!("{hostname}:{port}")),
+        )
+        .await
+        .context("Failed to resolve hostname")?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No address found for {hostname}"))?;
 
-        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, connect_config())
-            .await
-            .context("Failed to connect")?;
+        let mut session = await_connect_step(
+            "SSH TCP connect",
+            AsyncSession::<TokioTcpStream>::connect(addr, connect_config()),
+        )
+        .await
+        .context("Failed to connect")?;
 
-        session.handshake().await.context("SSH handshake failed")?;
+        await_connect_step("SSH handshake", session.handshake())
+            .await
+            .context("SSH handshake failed")?;
 
         let mut authenticated = false;
 
         if !config.identities_only {
+            super::agent_sock::ensure_ssh_auth_sock();
             tracing::debug!("Attempting SSH agent authentication");
-            match session.userauth_agent(user).await {
+            match await_connect_step("SSH agent auth", session.userauth_agent(user)).await {
                 Ok(_) => {
                     if session.authenticated() {
                         authenticated = true;
@@ -208,9 +237,11 @@ impl SessionManager {
                     }
                 }
 
-                match session
-                    .userauth_pubkey_file(user, None, identity_file, None)
-                    .await
+                match await_connect_step(
+                    "SSH identity file auth",
+                    session.userauth_pubkey_file(user, None, identity_file, None),
+                )
+                .await
                 {
                     Ok(_) => {
                         if session.authenticated() {
@@ -243,7 +274,12 @@ impl SessionManager {
                     let path = PathBuf::from(&key_path);
                     if path.exists() {
                         tracing::trace!(path = %path.display(), "Trying key file");
-                        match session.userauth_pubkey_file(user, None, &path, None).await {
+                        match await_connect_step(
+                            "SSH key file auth",
+                            session.userauth_pubkey_file(user, None, &path, None),
+                        )
+                        .await
+                        {
                             Ok(_) => {
                                 if session.authenticated() {
                                     authenticated = true;
@@ -287,12 +323,16 @@ impl SessionManager {
 
             error_msg.push_str(" Check that:");
             if !config.identities_only {
-                error_msg.push_str(" SSH agent is running,");
+                error_msg.push_str(
+                    " SSH agent is running with unlocked keys (ssh-add -l), SSH_AUTH_SOCK is reachable,",
+                );
             }
             if config.identity_file.is_some() {
                 error_msg.push_str(" the identity file exists and has correct permissions (600),");
             } else if !config.identities_only {
-                error_msg.push_str(" keys exist in ~/.ssh/,");
+                error_msg.push_str(
+                    " non-passphrase keys exist in ~/.ssh/ (passphrase keys need the agent),",
+                );
             }
             error_msg
                 .push_str(" and the public key is added to authorized_keys on the remote host.");
@@ -340,22 +380,32 @@ impl SessionManager {
         port: Option<u16>,
     ) -> Result<()> {
         let port = port.unwrap_or(22);
-        let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
-            .await
-            .context("Failed to resolve hostname")?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No address found for {}", host))?;
+        let addr = await_connect_step(
+            "Resolve hostname",
+            tokio::net::lookup_host(format!("{host}:{port}")),
+        )
+        .await
+        .context("Failed to resolve hostname")?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No address found for {host}"))?;
 
-        let mut session = AsyncSession::<TokioTcpStream>::connect(addr, connect_config())
-            .await
-            .context("Failed to connect")?;
+        let mut session = await_connect_step(
+            "SSH TCP connect",
+            AsyncSession::<TokioTcpStream>::connect(addr, connect_config()),
+        )
+        .await
+        .context("Failed to connect")?;
 
-        session.handshake().await.context("SSH handshake failed")?;
-
-        session
-            .userauth_password(user, password)
+        await_connect_step("SSH handshake", session.handshake())
             .await
-            .context("Password authentication failed")?;
+            .context("SSH handshake failed")?;
+
+        await_connect_step(
+            "SSH password auth",
+            session.userauth_password(user, password),
+        )
+        .await
+        .context("Password authentication failed")?;
 
         if !session.authenticated() {
             anyhow::bail!("Authentication failed for {}@{}", user, host);
@@ -392,7 +442,14 @@ impl SessionManager {
         sessions.contains_key(host_alias)
     }
 
-    /// Reconnects via ~/.ssh/config or a registered direct profile (after MCP process restart).
+    /// Ensures a live session exists for `host_alias`.
+    ///
+    /// Reuses an existing session, or reconnects via `~/.ssh/config` / a registered
+    /// direct profile (for example after MCP process restart).
+    ///
+    /// # Errors
+    ///
+    /// See the connect helpers for details when auto-connect fails.
     pub async fn ensure_connected(&self, host_alias: &str) -> Result<()> {
         if self.is_connected(host_alias).await {
             return Ok(());
@@ -459,10 +516,33 @@ impl SessionManager {
                 }
                 Ok(output)
             }
+            Err(SshCommandError::CommandTimeout {
+                limit,
+                idle,
+                session_recovered: false,
+            }) => {
+                if Self::reopen_shell(&mut state).await.is_ok() {
+                    return Err(SshCommandError::CommandTimeout {
+                        limit,
+                        idle,
+                        session_recovered: true,
+                    });
+                }
+                drop(state);
+                self.evict(host_alias).await;
+                let restored = self.ensure_connected(host_alias).await.is_ok();
+
+                Err(SshCommandError::CommandTimeout {
+                    limit,
+                    idle,
+                    session_recovered: restored,
+                })
+            }
             Err(e) => {
                 if e.should_evict_session() {
                     drop(state);
                     self.evict(host_alias).await;
+                    _ = self.ensure_connected(host_alias).await;
                 }
                 Err(e)
             }

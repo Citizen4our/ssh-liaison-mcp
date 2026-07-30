@@ -199,17 +199,17 @@ pub async fn ssh_connect_direct_impl(
     let p = &params.0;
     register_direct_profile_from_params(session_manager, p).await;
 
-    match session_manager
+    let key_result = session_manager
         .connect_direct(&p.host_alias, &p.user, &p.hostname, p.port)
-        .await
-    {
+        .await;
+    match key_result {
         Ok(()) => {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "Successfully connected to {}@{} using SSH keys",
                 p.user, p.hostname
             ))]));
         }
-        Err(e) => {
+        Err(ref e) => {
             tracing::debug!(error = %e, "SSH key authentication failed, trying password");
         }
     }
@@ -238,8 +238,12 @@ pub async fn ssh_connect_direct_impl(
         }
     }
 
+    let detail = key_result
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "unknown key auth failure".into());
     Err(McpError::invalid_params(
-        "SSH key authentication failed and no password provided".to_string(),
+        format!("SSH key authentication failed and no password provided. Detail: {detail}"),
         None,
     ))
 }

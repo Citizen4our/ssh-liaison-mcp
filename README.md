@@ -441,6 +441,12 @@ cargo fmt
 
 The server uses structured logging via the `tracing` crate. Control log verbosity with:
 
+### SSH agent (Cursor / GUI)
+
+Cursor often spawns MCP **without** `SSH_AUTH_SOCK`. Passphrase-protected keys then fail file auth (`Wrong passphrase…`), while terminal `ssh` still works via the agent.
+
+`ssh-liaison-mcp` ≥ 0.2.2 discovers the agent socket via `launchctl getenv SSH_AUTH_SOCK` (macOS) and `/tmp/ssh-*/agent.*` before `userauth_agent`. After upgrading, **restart the MCP server** in Cursor so it loads the new binary.
+
 ### Command-line flags
 
 ```bash
