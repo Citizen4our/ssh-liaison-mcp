@@ -1,6 +1,6 @@
 [package]
 name = "ssh-liaison-mcp"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "SSH connection and command execution via Model Context Protocol (MCP)"
 license = "MIT"
