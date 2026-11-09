@@ -154,7 +154,7 @@ async fn ensure_host_connected(
     session_manager.ensure_connected(host).await.map_err(|e| {
         McpError::invalid_params(
             format!(
-                "Not connected to host '{host}' and auto-connect failed ({e}). \
+                "Not connected to host '{host}' and auto-connect failed ({e:#}). \
                  Use ssh_connect (SSH config) or ssh_connect_direct first for direct hosts."
             ),
             None,
@@ -188,7 +188,7 @@ pub async fn ssh_connect_impl(
             "Successfully connected to '{}'",
             host_alias
         ))])),
-        Err(e) => Err(McpError::invalid_params(e.to_string(), None)),
+        Err(e) => Err(McpError::invalid_params(format!("{e:#}"), None)),
     }
 }
 
@@ -230,7 +230,7 @@ pub async fn ssh_connect_direct_impl(
             Err(e) => {
                 return Err(McpError::invalid_params(
                     format!(
-                        "Authentication failed: SSH keys and password both failed. Last error: {e}"
+                        "Authentication failed: SSH keys and password both failed. Last error: {e:#}"
                     ),
                     None,
                 ));
@@ -240,7 +240,7 @@ pub async fn ssh_connect_direct_impl(
 
     let detail = key_result
         .err()
-        .map(|e| e.to_string())
+        .map(|e| format!("{e:#}"))
         .unwrap_or_else(|| "unknown key auth failure".into());
     Err(McpError::invalid_params(
         format!("SSH key authentication failed and no password provided. Detail: {detail}"),

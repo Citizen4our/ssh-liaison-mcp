@@ -27,6 +27,16 @@
 
 ## 📦 Installation
 
+### Cargo (recommended)
+
+```bash
+cargo install --git https://github.com/Citizen4our/ssh-liaison-mcp
+```
+
+The binary is installed to `~/.cargo/bin/ssh-liaison-mcp`. Use this absolute path as `command` in the MCP config of Cursor, Claude, and opencode. GUI apps often lack `~/.cargo/bin` in `PATH`.
+
+To update, run the same command with `--force`, then restart the MCP server.
+
 ### Pre-built Binaries
 
 Download the latest release for your platform from the [Releases page](https://github.com/Citizen4our/ssh-liaison-mcp/releases).
@@ -446,6 +456,15 @@ The server uses structured logging via the `tracing` crate. Control log verbosit
 Cursor often spawns MCP **without** `SSH_AUTH_SOCK`. Passphrase-protected keys then fail file auth (`Wrong passphrase…`), while terminal `ssh` still works via the agent.
 
 `ssh-liaison-mcp` ≥ 0.2.2 discovers the agent socket via `launchctl getenv SSH_AUTH_SOCK` (macOS) and `/tmp/ssh-*/agent.*` before `userauth_agent`. After upgrading, **restart the MCP server** in Cursor so it loads the new binary.
+
+Do not hard-code `SSH_AUTH_SOCK` in the MCP `env`. The launchd path changes after each reboot. Discovery handles it.
+
+Authentication order:
+
+1. All agent keys. With `IdentitiesOnly yes`, only keys that match an `IdentityFile` (`.pub` or `-cert.pub`).
+2. Identity files. An OpenSSH certificate `<key>-cert.pub` is tried before the bare key.
+
+A failed login lists each attempt and its reason. The agent cannot present a certificate that is not loaded into it. In that case the file with `-cert.pub` is used.
 
 ### Command-line flags
 

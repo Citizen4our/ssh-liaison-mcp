@@ -51,7 +51,7 @@ pub async fn run_cli_mode(
                         }
                     } else {
                         anyhow::bail!(
-                            "Failed to connect to {}@{}:{} - {}",
+                            "Failed to connect to {}@{}:{} - {:#}",
                             user,
                             hostname,
                             port,
@@ -60,7 +60,7 @@ pub async fn run_cli_mode(
                     }
                 } else {
                     anyhow::bail!(
-                        "Failed to connect to {}@{}:{} - {}",
+                        "Failed to connect to {}@{}:{} - {:#}",
                         user,
                         hostname,
                         port,

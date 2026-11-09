@@ -1,4 +1,5 @@
 pub mod agent_sock;
+pub mod auth;
 pub mod channel;
 pub mod config;
 pub mod error;
